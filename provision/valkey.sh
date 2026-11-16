@@ -7,6 +7,9 @@
 #   sh provision/valkey.sh --check-names <list>  Check the names. No server.
 set -eu
 
+# shellcheck source=/dev/null
+. "$(dirname "$0")/check-password.sh"
+
 # A service name is a PostgreSQL role and a Valkey user. Both scripts use the same rule.
 # The name "default" is the Valkey admin user. A name check that accepts it
 # would let "ACL SETUSER default reset ..." replace the admin password.
@@ -37,15 +40,28 @@ if [ "${1:-}" = "--check-names" ]; then
   exit $?
 fi
 
-: "${VALKEY_ADMIN_PASSWORD:?VALKEY_ADMIN_PASSWORD is not set}"
 services="${CONSTELLATION_SERVICES:-}"
 check_list "$services" || exit 1
+
+# Examine each password before the script changes anything.
+check_password VALKEY_ADMIN_PASSWORD "${VALKEY_ADMIN_PASSWORD:-}" || exit 1
+check_no_whitespace VALKEY_ADMIN_PASSWORD "$VALKEY_ADMIN_PASSWORD" || exit 1
+rest="$services,"
+while [ -n "$services" ] && [ -n "$rest" ]; do
+  name="${rest%%,*}"
+  rest="${rest#*,}"
+  upper=$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')
+  pw=$(printenv "${upper}_VALKEY_PASSWORD" || true)
+  check_password "${upper}_VALKEY_PASSWORD" "$pw" || exit 1
+  check_no_whitespace "${upper}_VALKEY_PASSWORD" "$pw" || exit 1
+done
 
 # valkey-cli reads the admin password from this variable. The -a flag is not used.
 export REDISCLI_AUTH="$VALKEY_ADMIN_PASSWORD"
 
+# The commands go to valkey-cli through stdin, not as arguments.
 cli() {
-  valkey-cli -h valkey "$@"
+  printf '%s\n' "$1" | valkey-cli -h valkey
 }
 
 expect_ok() {
@@ -55,32 +71,31 @@ expect_ok() {
   fi
 }
 
+# The ACL rule has the SHA-256 hash of the password, not the password. The rule is the
+# ACL of the platform: own key prefix only, no admin or dangerous commands, no scripts,
+# and no command that Valkey does not filter by key pattern (SCAN, RANDOMKEY, DBSIZE, MEMORY).
 provision() {
   svc="$1"
   upper=$(printf '%s' "$svc" | tr '[:lower:]' '[:upper:]')
   pw=$(printenv "${upper}_VALKEY_PASSWORD" || true)
-  if [ -z "$pw" ]; then
-    echo "ERROR: ${upper}_VALKEY_PASSWORD is not set" >&2
-    return 1
-  fi
-  reply=$(cli ACL SETUSER "$svc" reset on ">$pw" "~$svc:*" \
-    +@all -@admin -@dangerous -function "-script|flush" "-script|kill")
+  hash=$(printf '%s' "$pw" | sha256sum | cut -d' ' -f1)
+  reply=$(cli "ACL SETUSER $svc reset on #$hash ~$svc:* +@all -@admin -@dangerous -@scripting -function -scan -randomkey -dbsize -memory")
   expect_ok "$reply"
   echo "valkey: provisioned $svc"
 }
 
 if [ -z "$services" ]; then
   echo "valkey: no services in CONSTELLATION_SERVICES"
-  exit 0
+else
+  rest="$services,"
+  while [ -n "$rest" ]; do
+    name="${rest%%,*}"
+    rest="${rest#*,}"
+    provision "$name"
+  done
 fi
 
-rest="$services,"
-while [ -n "$rest" ]; do
-  name="${rest%%,*}"
-  rest="${rest#*,}"
-  provision "$name"
-done
-
 # Write the users to the ACL file in the valkey-data volume. The users stay after a restart.
-reply=$(cli ACL SAVE)
+# This also replaces an old ACL file that has the admin password in plain text.
+reply=$(cli "ACL SAVE")
 expect_ok "$reply"

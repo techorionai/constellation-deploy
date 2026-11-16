@@ -7,6 +7,9 @@
 #   sh provision/postgres.sh --check-names <list>  Check the names. No server.
 set -eu
 
+# shellcheck source=/dev/null
+. "$(dirname "$0")/check-password.sh"
+
 # A service name is a PostgreSQL role and a Valkey user. Both scripts use the same rule.
 check_name() {
   case "$1" in
@@ -35,27 +38,51 @@ if [ "${1:-}" = "--check-names" ]; then
   exit $?
 fi
 
+# Connection limit of each service role. Valid values are whole numbers of 1 or more.
+limit="${SERVICE_DB_CONNECTION_LIMIT:-50}"
+case "$limit" in
+  '' | *[!0-9]* | 0)
+    echo "ERROR: SERVICE_DB_CONNECTION_LIMIT must be a whole number of 1 or more" >&2
+    exit 1
+    ;;
+esac
+
 : "${POSTGRES_USER:?POSTGRES_USER is not set}"
-: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set}"
 services="${CONSTELLATION_SERVICES:-}"
 check_list "$services" || exit 1
 
+# Examine each password before the script changes anything.
+check_password POSTGRES_PASSWORD "${POSTGRES_PASSWORD:-}" || exit 1
+rest="$services,"
+while [ -n "$services" ] && [ -n "$rest" ]; do
+  name="${rest%%,*}"
+  rest="${rest#*,}"
+  upper=$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')
+  check_password "${upper}_DB_PASSWORD" "$(printenv "${upper}_DB_PASSWORD" || true)" || exit 1
+done
+
 export PGPASSWORD="$POSTGRES_PASSWORD"
+
+# Service roles cannot connect to the default databases, and they cannot make temporary tables there.
+psql -h postgres -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -q <<'SQL'
+REVOKE CONNECT, TEMP ON DATABASE postgres FROM PUBLIC;
+REVOKE CONNECT, TEMP ON DATABASE template1 FROM PUBLIC;
+SQL
 
 provision() {
   svc="$1"
   upper=$(printf '%s' "$svc" | tr '[:lower:]' '[:upper:]')
   pw=$(printenv "${upper}_DB_PASSWORD" || true)
-  if [ -z "$pw" ]; then
-    echo "ERROR: ${upper}_DB_PASSWORD is not set" >&2
-    return 1
-  fi
-  # The psql variables and format() quote the values. A value cannot inject SQL.
-  psql -h postgres -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -q \
-    -v name="$svc" -v pw="$pw" <<'SQL'
+  # The values go to psql through the environment. They are not on the command line.
+  # \getenv and format() quote the values. A value cannot inject SQL.
+  SVC_NAME="$svc" SVC_PW="$pw" SVC_LIMIT="$limit" \
+    psql -h postgres -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -q <<'SQL'
+\getenv name SVC_NAME
+\getenv pw SVC_PW
+\getenv limit SVC_LIMIT
 SELECT format('CREATE ROLE %I LOGIN', :'name')
 WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'name') \gexec
-SELECT format('ALTER ROLE %I LOGIN PASSWORD %L', :'name', :'pw') \gexec
+SELECT format('ALTER ROLE %I LOGIN PASSWORD %L CONNECTION LIMIT %s', :'name', :'pw', :'limit') \gexec
 SELECT format('CREATE DATABASE %I OWNER %I', :'name', :'name')
 WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = :'name') \gexec
 SELECT format('REVOKE CONNECT ON DATABASE %I FROM PUBLIC', :'name') \gexec
