@@ -1,0 +1,4 @@
+services:
+  app:
+    image: postgres:18.7-alpine
+    ports: ["0.0.0.0:8080:8080"]

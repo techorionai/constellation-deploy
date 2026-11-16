@@ -1,1 +1,1 @@
-ERROR: example-password: APP_PASSWORD
+ERROR: example-secret: APP_PASSWORD
