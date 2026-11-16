@@ -4,26 +4,47 @@ x-provision-env-file: &provision-env-file
   - path: ${CONSTELLATION_ENV_FILE:-.env}
     required: true
 
+# Container hardening for all services (finding R14 of the PR review). A service that needs a
+# capability adds it with cap_add. Do not add resource limits here.
+x-hardened: &hardened
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
 services:
   postgres:
+    <<: *hardened
     image: postgres:18.7-alpine
     restart: unless-stopped
+    # The entrypoint rejects a weak admin password. Then it calls the image entrypoint.
+    entrypoint: ["sh", "/provision/postgres-entrypoint.sh"]
     command: ["postgres", "-c", "max_connections=${POSTGRES_MAX_CONNECTIONS:-200}"]
+    # The image entrypoint changes the owner of the data folder and starts PostgreSQL
+    # as the postgres user.
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the env file}
       POSTGRES_DB: postgres
     volumes:
       - postgres-data:/var/lib/postgresql
+      - ./provision:/provision:ro
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-postgres}", "-d", "postgres"]
       interval: 5s
       timeout: 5s
       retries: 20
     networks:
-      - constellation
+      - services
 
   valkey:
+    <<: *hardened
     image: valkey/valkey:9.0.7-alpine
     restart: unless-stopped
     entrypoint: ["sh", "/provision/valkey-entrypoint.sh"]
@@ -36,6 +57,13 @@ services:
       - noeviction
       - --aclfile
       - /data/acl/users.acl
+    # The image entrypoint changes the owner of /data and starts valkey-server
+    # as the valkey user.
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
     environment:
       VALKEY_ADMIN_PASSWORD: ${VALKEY_ADMIN_PASSWORD:?Set VALKEY_ADMIN_PASSWORD in the env file}
     volumes:
@@ -47,9 +75,10 @@ services:
       timeout: 5s
       retries: 20
     networks:
-      - constellation
+      - services
 
   provision-postgres:
+    <<: *hardened
     image: postgres:18.7-alpine
     restart: "no"
     entrypoint: ["sh", "/provision/postgres.sh"]
@@ -60,9 +89,10 @@ services:
       postgres:
         condition: service_healthy
     networks:
-      - constellation
+      - services
 
   provision-valkey:
+    <<: *hardened
     image: valkey/valkey:9.0.7-alpine
     restart: "no"
     entrypoint: ["sh", "/provision/valkey.sh"]
@@ -73,9 +103,10 @@ services:
       valkey:
         condition: service_healthy
     networks:
-      - constellation
+      - services
 
   otel-collector:
+    <<: *hardened
     image: otel/opentelemetry-collector-contrib:0.165.0
     restart: unless-stopped
     command: ["--config=/etc/otelcol/config.yaml"]
@@ -89,9 +120,11 @@ services:
       tempo:
         condition: service_started
     networks:
-      - constellation
+      - services
+      - observability
 
   prometheus:
+    <<: *hardened
     image: prom/prometheus:v3.16.0
     restart: unless-stopped
     command:
@@ -108,9 +141,10 @@ services:
       timeout: 5s
       retries: 20
     networks:
-      - constellation
+      - observability
 
   loki:
+    <<: *hardened
     image: grafana/loki:3.7.10
     restart: unless-stopped
     command: ["-config.file=/etc/loki/config.yaml", "-config.expand-env=true"]
@@ -120,9 +154,10 @@ services:
       - ./config/loki.yaml:/etc/loki/config.yaml:ro
       - loki-data:/loki
     networks:
-      - constellation
+      - observability
 
   tempo:
+    <<: *hardened
     image: grafana/tempo:3.1.1
     restart: unless-stopped
     command: ["-target=all", "-config.file=/etc/tempo/config.yaml", "-config.expand-env=true"]
@@ -132,14 +167,22 @@ services:
       - ./config/tempo.yaml:/etc/tempo/config.yaml:ro
       - tempo-data:/var/tempo
     networks:
-      - constellation
+      - observability
 
   grafana:
+    <<: *hardened
     image: grafana/grafana:13.3.1
     restart: unless-stopped
+    # The entrypoint rejects a weak admin password or secret key. Then it calls /run.sh.
+    entrypoint: ["sh", "/provision/grafana-entrypoint.sh"]
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in the env file}
+      GF_SECURITY_SECRET_KEY: ${GRAFANA_SECRET_KEY:?Set GRAFANA_SECRET_KEY in the env file}
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_PLUGINS_PLUGIN_ADMIN_ENABLED: "false"
+      GF_ANALYTICS_FEEDBACK_LINKS_ENABLED: "false"
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_AUTH_ANONYMOUS_ENABLED: "false"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
@@ -149,6 +192,7 @@ services:
       - "${GRAFANA_BIND:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000"
     volumes:
       - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./provision:/provision:ro
       - grafana-data:/var/lib/grafana
     depends_on:
       prometheus:
@@ -163,10 +207,13 @@ services:
       timeout: 5s
       retries: 30
     networks:
-      - constellation
+      - observability
 
+# Two networks (finding R4 of the PR review). Only the collector is on both.
+# A business service joins "services". It cannot reach Loki, Tempo, or Prometheus.
 networks:
-  constellation:
+  services:
+  observability:
 
 volumes:
   postgres-data:
