@@ -1,0 +1,13 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  compose:
+    uses: techorionai/constellation-ci/.github/workflows/compose.yml@v0.2.0
+    with:
+      unit-command: bash scripts/check-compose.sh && bash tests/check-compose-cases.sh
+      integration-command: bash scripts/smoke-test.sh
