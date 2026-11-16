@@ -1,0 +1,104 @@
+#!/bin/sh
+# Make one PostgreSQL role and one database for each name in CONSTELLATION_SERVICES.
+# The script is idempotent. A second run gives the same result.
+#
+# Usage:
+#   sh provision/postgres.sh                       Provision the services.
+#   sh provision/postgres.sh --check-names <list>  Check the names. No server.
+set -eu
+
+# shellcheck source=/dev/null
+. "$(dirname "$0")/check-password.sh"
+
+# A service name is a PostgreSQL role and a Valkey user. Both scripts use the same rule.
+check_name() {
+  case "$1" in
+    '' | [!a-z]* | *[!a-z0-9_]*) return 1 ;;
+    default | public | postgres | template0 | template1 | pg_*) return 1 ;;
+  esac
+  [ "${#1}" -le 32 ]
+}
+
+# Check each name of a comma-separated list. An empty list is valid.
+check_list() {
+  [ -n "$1" ] || return 0
+  rest="$1,"
+  while [ -n "$rest" ]; do
+    name="${rest%%,*}"
+    rest="${rest#*,}"
+    if ! check_name "$name"; then
+      echo "ERROR: bad service name: $name" >&2
+      return 1
+    fi
+  done
+}
+
+if [ "${1:-}" = "--check-names" ]; then
+  check_list "${2:-}"
+  exit $?
+fi
+
+# Connection limit of each service role. Valid values are whole numbers of 1 or more.
+limit="${SERVICE_DB_CONNECTION_LIMIT:-50}"
+case "$limit" in
+  '' | *[!0-9]* | 0)
+    echo "ERROR: SERVICE_DB_CONNECTION_LIMIT must be a whole number of 1 or more" >&2
+    exit 1
+    ;;
+esac
+
+: "${POSTGRES_USER:?POSTGRES_USER is not set}"
+services="${CONSTELLATION_SERVICES:-}"
+check_list "$services" || exit 1
+
+# Examine each password before the script changes anything.
+check_password POSTGRES_PASSWORD "${POSTGRES_PASSWORD:-}" || exit 1
+rest="$services,"
+while [ -n "$services" ] && [ -n "$rest" ]; do
+  name="${rest%%,*}"
+  rest="${rest#*,}"
+  upper=$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')
+  check_password "${upper}_DB_PASSWORD" "$(printenv "${upper}_DB_PASSWORD" || true)" || exit 1
+done
+
+export PGPASSWORD="$POSTGRES_PASSWORD"
+
+# Service roles cannot connect to the default databases, and they cannot make temporary tables there.
+psql -h postgres -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -q <<'SQL'
+REVOKE CONNECT, TEMP ON DATABASE postgres FROM PUBLIC;
+REVOKE CONNECT, TEMP ON DATABASE template1 FROM PUBLIC;
+SQL
+
+provision() {
+  svc="$1"
+  upper=$(printf '%s' "$svc" | tr '[:lower:]' '[:upper:]')
+  pw=$(printenv "${upper}_DB_PASSWORD" || true)
+  # The values go to psql through the environment. They are not on the command line.
+  # \getenv and format() quote the values. A value cannot inject SQL.
+  SVC_NAME="$svc" SVC_PW="$pw" SVC_LIMIT="$limit" \
+    psql -h postgres -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -q <<'SQL'
+\getenv name SVC_NAME
+\getenv pw SVC_PW
+\getenv limit SVC_LIMIT
+SELECT format('CREATE ROLE %I LOGIN', :'name')
+WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'name') \gexec
+SELECT format('ALTER ROLE %I LOGIN PASSWORD %L CONNECTION LIMIT %s', :'name', :'pw', :'limit') \gexec
+SELECT format('CREATE DATABASE %I OWNER %I', :'name', :'name')
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = :'name') \gexec
+SELECT format('REVOKE CONNECT ON DATABASE %I FROM PUBLIC', :'name') \gexec
+SELECT format('GRANT CONNECT ON DATABASE %I TO %I', :'name', :'name') \gexec
+SQL
+  echo "postgres: provisioned $svc"
+}
+
+if [ -z "$services" ]; then
+  echo "postgres: no services in CONSTELLATION_SERVICES"
+  exit 0
+fi
+
+rest="$services,"
+while [ -n "$rest" ]; do
+  name="${rest%%,*}"
+  rest="${rest#*,}"
+  provision "$name"
+done

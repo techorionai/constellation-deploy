@@ -1,0 +1,6 @@
+services:
+  app:
+    image: postgres:18.7-alpine
+    ports:
+      - target: 8080
+        published: 8080

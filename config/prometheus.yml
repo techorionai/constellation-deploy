@@ -1,0 +1,5 @@
+# Services push metrics with OTLP. Prometheus has no scrape jobs.
+global:
+  scrape_interval: 15s
+
+scrape_configs: []

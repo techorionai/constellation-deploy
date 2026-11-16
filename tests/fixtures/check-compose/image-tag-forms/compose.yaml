@@ -1,0 +1,11 @@
+services:
+  app:
+    image: postgres:18.7-alpine
+    ports:
+      - "${APP_BIND:-127.0.0.1}:${APP_PORT:-8080}:8080"
+  prom:
+    image: prom/prometheus:v3.16.0
+  valkey:
+    image: valkey/valkey:9.0.7-alpine
+  pinned:
+    image: busybox@sha256:0000000000000000000000000000000000000000000000000000000000000000
