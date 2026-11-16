@@ -114,6 +114,19 @@ expect_output() {
   fi
 }
 
+# Arguments: expected output, then the command. The whole output must be equal to the text.
+# A substring match is not enough: an error text can have the same letters.
+expect_exact() {
+  local want="$1" output
+  shift
+  output="$("$@" 2>&1 | tr -d '\r')" || true
+  if [ "$output" != "$want" ]; then
+    echo "expected output: $want"
+    echo "output: $output"
+    return 1
+  fi
+}
+
 expect_refused() {
   # Arguments: expected text, then the command. The command must fail.
   local want="$1" output
@@ -141,8 +154,8 @@ test_postgres_own() {
 # I5: SET, GET, and XADD in the own key prefix.
 test_valkey_own() {
   local svc="$1" password="$2"
-  expect_output OK vk "$svc" "$password" SET "$svc:k" v || return 1
-  expect_output v vk "$svc" "$password" GET "$svc:k" || return 1
+  expect_exact OK vk "$svc" "$password" SET "$svc:k" v || return 1
+  expect_exact v vk "$svc" "$password" GET "$svc:k" || return 1
   vk "$svc" "$password" XADD "$svc:s" '*' f v >/dev/null
 }
 
@@ -214,6 +227,16 @@ test_valkey_settings() {
   expect_output noeviction vk_admin CONFIG GET maxmemory-policy
 }
 
+# I20: commands that Valkey does not filter by key pattern are refused.
+test_valkey_unfiltered_commands() {
+  local password
+  password="$(envval SMOKE_A_VALKEY_PASSWORD)"
+  expect_output NOPERM vk smoke_a "$password" SCAN 0 || return 1
+  expect_output NOPERM vk smoke_a "$password" RANDOMKEY || return 1
+  expect_output NOPERM vk smoke_a "$password" DBSIZE || return 1
+  expect_output NOPERM vk smoke_a "$password" MEMORY STATS
+}
+
 # I9: run both provisioning services again.
 test_reprovision() {
   dc run --rm --no-deps -T provision-postgres || return 1
@@ -251,8 +274,17 @@ test_new_service() {
     echo "SMOKE_C_DB_PASSWORD=$pw_db"
     echo "SMOKE_C_VALKEY_PASSWORD=$pw_valkey"
   } >> "$extra_env_file"
-  docker compose -p "$project" --env-file "$extra_env_file" run --rm --no-deps -T provision-postgres || return 1
-  docker compose -p "$project" --env-file "$extra_env_file" run --rm --no-deps -T provision-valkey || return 1
+  local output
+  output="$(docker compose -p "$project" --env-file "$extra_env_file" run --rm --no-deps -T provision-postgres 2>&1)" \
+    || { printf '%s\n' "$output"; return 1; }
+  output="$output
+$(docker compose -p "$project" --env-file "$extra_env_file" run --rm --no-deps -T provision-valkey 2>&1)" \
+    || { printf '%s\n' "$output"; return 1; }
+  # R18: the output of the provisioning of smoke_c has no password of smoke_c.
+  if printf '%s' "$output" | grep -qF -e "$pw_db" -e "$pw_valkey"; then
+    echo "the output of the provisioning has a password of smoke_c"
+    return 1
+  fi
   test_postgres_own smoke_c "$pw_db" || return 1
   test_valkey_own smoke_c "$pw_valkey"
 }
@@ -261,10 +293,11 @@ random_hex() {
   od -An -N"$1" -tx1 /dev/urandom | tr -d ' \n'
 }
 
-# Send one OTLP HTTP request from the grafana container. Arguments: signal path, JSON body.
+# Send one OTLP HTTP request from the postgres container. This container is on the network
+# "services" only, like a business service. Arguments: signal path, JSON body.
 otlp_post() {
-  printf '%s' "$2" | gcurl -fsS -X POST -H 'Content-Type: application/json' \
-    --data-binary @- "http://otel-collector:4318/v1/$1" >/dev/null
+  dc exec -T postgres wget -q -T 10 -O /dev/null --header 'Content-Type: application/json' \
+    --post-data "$2" "http://otel-collector:4318/v1/$1"
 }
 
 # I12: one trace, one metric, and one log record go through the collector.
@@ -296,6 +329,45 @@ prometheus_has_metric() {
 loki_has_log() {
   gcurl -fsS -G --data-urlencode 'query={service_name="smoke-test"}' \
     http://loki:3100/loki/api/v1/query_range | grep -qF -- "$1"
+}
+
+# I22: a container on the network "services" cannot reach the stores. It reaches the collector.
+test_network_isolation() {
+  local url output
+  for url in http://loki:3100/ready http://tempo:3200/ready http://prometheus:9090/-/ready; do
+    if output="$(dc exec -T postgres wget -q -T 5 -O /dev/null "$url" 2>&1)"; then
+      echo "a container on the network services reaches $url"
+      return 1
+    fi
+    if ! printf '%s' "$output" | grep -qF 'bad address'; then
+      echo "expected a name error for $url, got: $output"
+      return 1
+    fi
+  done
+  otlp_post logs '{"resourceLogs":[]}' || { echo "the collector does not accept an OTLP request"; return 1; }
+}
+
+# I23: the scripts reject the placeholder, a short password, and white space in a Valkey password.
+# The command line of "docker compose run" has test values. They are not real passwords.
+test_weak_passwords() {
+  local weak msg
+  for weak in change-me short-pw; do
+    msg=placeholder
+    [ "$weak" = short-pw ] && msg="too short"
+    expect_refused "$msg" dc run --rm --no-deps -T -e "SMOKE_A_DB_PASSWORD=$weak" provision-postgres || return 1
+    expect_refused "$msg" dc run --rm --no-deps -T -e "POSTGRES_PASSWORD=$weak" provision-postgres || return 1
+    expect_refused "$msg" dc run --rm --no-deps -T -e "SMOKE_A_VALKEY_PASSWORD=$weak" provision-valkey || return 1
+    expect_refused "$msg" dc run --rm --no-deps -T -e "VALKEY_ADMIN_PASSWORD=$weak" provision-valkey || return 1
+    expect_refused "$msg" dc run --rm --no-deps -T -e "POSTGRES_PASSWORD=$weak" postgres || return 1
+    expect_refused "$msg" dc run --rm --no-deps -T -e "VALKEY_ADMIN_PASSWORD=$weak" valkey || return 1
+    expect_refused "$msg" dc run --rm --no-deps -T -e "GF_SECURITY_ADMIN_PASSWORD=$weak" grafana || return 1
+    expect_refused "$msg" dc run --rm --no-deps -T -e "GF_SECURITY_SECRET_KEY=$weak" grafana || return 1
+  done
+  expect_refused "white space" dc run --rm --no-deps -T \
+    -e "SMOKE_A_VALKEY_PASSWORD=has a space inside" provision-valkey || return 1
+  # The refused runs changed nothing: the passwords of smoke_a still work.
+  test_postgres_own smoke_a "$(envval SMOKE_A_DB_PASSWORD)" || return 1
+  test_valkey_own smoke_a "$(envval SMOKE_A_VALKEY_PASSWORD)"
 }
 
 # I13: Grafana health and data sources.
@@ -351,6 +423,13 @@ run_check "I2: own database, table, and advisory locks" \
   test_postgres_own smoke_a "$(envval SMOKE_A_DB_PASSWORD)"
 run_check "I3: other database is refused" \
   expect_refused CONNECT pg smoke_a "$(envval SMOKE_A_DB_PASSWORD)" smoke_b -c 'SELECT 1'
+run_check "I3: database postgres is refused" \
+  expect_refused CONNECT pg smoke_a "$(envval SMOKE_A_DB_PASSWORD)" postgres -c 'SELECT 1'
+run_check "I3: database template1 is refused" \
+  expect_refused CONNECT pg smoke_a "$(envval SMOKE_A_DB_PASSWORD)" template1 -c 'SELECT 1'
+run_check "I3: role has a connection limit" \
+  expect_exact 50 pg smoke_a "$(envval SMOKE_A_DB_PASSWORD)" smoke_a \
+  -c "SELECT rolconnlimit FROM pg_roles WHERE rolname = current_user"
 run_check "I4: wrong password is refused" \
   expect_refused "password authentication failed" pg smoke_a wrong-password smoke_a -c 'SELECT 1'
 run_check "I5: Valkey own prefix" \
@@ -361,6 +440,9 @@ run_check "I7a: Valkey FLUSHALL is refused" \
   expect_output NOPERM vk smoke_a "$(envval SMOKE_A_VALKEY_PASSWORD)" FLUSHALL
 run_check "I7b: Valkey CONFIG is refused" \
   expect_output NOPERM vk smoke_a "$(envval SMOKE_A_VALKEY_PASSWORD)" CONFIG GET maxmemory-policy
+run_check "I20: Valkey SCAN, RANDOMKEY, DBSIZE, and MEMORY are refused" test_valkey_unfiltered_commands
+run_check "I21: Valkey EVAL is refused" \
+  expect_output NOPERM vk smoke_a "$(envval SMOKE_A_VALKEY_PASSWORD)" EVAL "return 1" 0
 run_check "I8: Valkey appendonly and noeviction" test_valkey_settings
 run_check "I18: password with a single quote" \
   test_postgres_own smoke_b "$(envval SMOKE_B_DB_PASSWORD)"
@@ -368,6 +450,8 @@ run_check "I9: provisioning again" test_reprovision
 run_check "I10: Valkey restart" test_valkey_restart
 run_check "I19: valkey-server is not root" test_valkey_not_root
 run_check "I11: new service" test_new_service
+run_check "I22: network isolation of the stores" test_network_isolation
+run_check "I23: weak passwords are refused" test_weak_passwords
 run_check "I12: telemetry through the collector" test_telemetry
 run_check "I13: Grafana health and data sources" test_grafana
 run_check "I14: Grafana without credentials" test_grafana_anonymous
