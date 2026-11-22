@@ -20,6 +20,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 project=constellation-smoke
 env_file=tests/smoke.env
 extra_env_file=tests/.smoke-extra.env
+key_dir=""
 failures=()
 
 dc() {
@@ -36,6 +37,9 @@ cleanup() {
   local code=$?
   dc down -v --remove-orphans >/dev/null 2>&1
   rm -f "$extra_env_file"
+  if [ -n "$key_dir" ]; then
+    rm -rf "$key_dir"
+  fi
   local containers volumes
   containers="$(docker ps -aq --filter "label=com.docker.compose.project=$project")"
   volumes="$(docker volume ls -q --filter "label=com.docker.compose.project=$project")"
@@ -186,7 +190,7 @@ test_up() {
 check_states() {
   local states service state health code
   states="$(dc ps -a --format '{{.Service}} {{.State}} {{.Health}} {{.ExitCode}}')"
-  for service in postgres valkey prometheus grafana; do
+  for service in postgres valkey prometheus grafana identity; do
     health="$(printf '%s\n' "$states" | awk -v s="$service" '$1 == s { print $3 }')"
     if [ "$health" != "healthy" ]; then
       echo "$service is not healthy: $health"
@@ -410,6 +414,96 @@ test_no_password_in_logs() {
   done < <(grep -E '^[A-Za-z0-9_]*_PASSWORD=' "$env_file")
 }
 
+# Make the master key of identity in a temporary folder with the procedure of docs/compose.md.
+# The folder has mode 0700 and the file has mode 0444, so the container user can read it.
+# The script exports the path. A shell variable overrides the env file.
+make_master_key() {
+  key_dir="$(mktemp -d)" || return 1
+  chmod 0700 "$key_dir"
+  openssl rand -base64 32 > "$key_dir/identity-master-key" || return 1
+  chmod 0444 "$key_dir/identity-master-key"
+  # Docker on Windows needs a Windows path. Git Bash gives one with cygpath.
+  if command -v cygpath >/dev/null 2>&1; then
+    IDENTITY_MASTER_KEY_FILE="$(cygpath -m "$key_dir")/identity-master-key"
+  else
+    IDENTITY_MASTER_KEY_FILE="$key_dir/identity-master-key"
+  fi
+  export IDENTITY_MASTER_KEY_FILE
+}
+
+# Read a URL from the container postgres. It is in the network "services", like a business service.
+svc_get() {
+  dc exec -T postgres wget -q -T 10 -O - "$1"
+}
+
+# I25: the JWKS has one public ES256 key and no private part.
+test_identity_jwks() {
+  local jwks count
+  jwks="$(svc_get http://identity:8080/.well-known/jwks.json)" || return 1
+  count="$(printf '%s' "$jwks" | grep -o '"kty"' | wc -l | tr -d ' ')"
+  if [ "$count" != "1" ]; then
+    echo "expected one key, got $count: $jwks"
+    return 1
+  fi
+  local want
+  for want in '"kty"[[:space:]]*:[[:space:]]*"EC"' '"crv"[[:space:]]*:[[:space:]]*"P-256"' '"alg"[[:space:]]*:[[:space:]]*"ES256"'; do
+    if ! printf '%s' "$jwks" | grep -Eq "$want"; then
+      echo "the JWKS does not match $want: $jwks"
+      return 1
+    fi
+  done
+  if printf '%s' "$jwks" | grep -Eq '"d"[[:space:]]*:'; then
+    echo "the JWKS has a private key part"
+    return 1
+  fi
+}
+
+# I26: the discovery document has the issuer.
+test_identity_discovery() {
+  local doc issuer
+  issuer="$(envval IDENTITY_ISSUER)"
+  doc="$(svc_get http://identity:8080/.well-known/openid-configuration)" || return 1
+  if ! printf '%s' "$doc" | grep -Eq "\"issuer\"[[:space:]]*:[[:space:]]*\"$issuer\""; then
+    echo "the issuer is not $issuer: $doc"
+    return 1
+  fi
+}
+
+# I27: the log has one record about the setup link. It has no link and no token.
+test_identity_setup_log() {
+  local logs count
+  logs="$(dc logs identity 2>&1 | tr -d '\r')" || return 1
+  count="$(printf '%s\n' "$logs" | grep -cF 'identity: first-admin setup link')"
+  if [ "$count" != "1" ]; then
+    echo "expected one setup link record, got $count"
+    return 1
+  fi
+  if printf '%s' "$logs" | grep -qF '/setup?token='; then
+    echo "the log has a setup link"
+    return 1
+  fi
+}
+
+# I29: the log has no password and no master key.
+test_identity_no_secret_in_logs() {
+  local logs value name
+  logs="$(dc logs identity 2>&1)" || return 1
+  for name in IDENTITY_DB_PASSWORD IDENTITY_VALKEY_PASSWORD; do
+    value="$(envval "$name")"
+    if printf '%s' "$logs" | grep -qF -- "$value"; then
+      echo "the log has the value of $name"
+      return 1
+    fi
+  done
+  value="$(tr -d '\r\n' < "$key_dir/identity-master-key")"
+  if printf '%s' "$logs" | grep -qF -- "$value"; then
+    echo "the log has the master key"
+    return 1
+  fi
+}
+
+make_master_key || { echo "FAIL: the master key of identity"; exit 1; }
+
 # Remove a project of an earlier run.
 dc down -v --remove-orphans >/dev/null 2>&1
 
@@ -456,6 +550,17 @@ run_check "I12: telemetry through the collector" test_telemetry
 run_check "I13: Grafana health and data sources" test_grafana
 run_check "I14: Grafana without credentials" test_grafana_anonymous
 run_check "I15: no password in provisioning logs" test_no_password_in_logs
+
+run_check "I25: identity JWKS" test_identity_jwks
+run_check "I26: identity discovery document" test_identity_discovery
+run_check "I27: identity setup link record" test_identity_setup_log
+run_check "I28a: identity database role cannot connect to another database" \
+  expect_refused CONNECT pg identity "$(envval IDENTITY_DB_PASSWORD)" smoke_a -c 'SELECT 1'
+run_check "I28b: identity Valkey user cannot read another prefix" \
+  expect_output NOPERM vk identity "$(envval IDENTITY_VALKEY_PASSWORD)" GET smoke_a:k
+run_check "I28c: identity Valkey user can write its prefix" \
+  expect_exact OK vk identity "$(envval IDENTITY_VALKEY_PASSWORD)" SET identity:smoke 1
+run_check "I29: no secret in the identity log" test_identity_no_secret_in_logs
 
 if [ "${#failures[@]}" -ne 0 ]; then
   echo "smoke-test: ${#failures[@]} check(s) failed: ${failures[*]}"
