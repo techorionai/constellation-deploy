@@ -209,11 +209,56 @@ services:
     networks:
       - observability
 
+  identity:
+    <<: *hardened
+    image: ghcr.io/techorionai/constellation-identity:0.1.0
+    restart: unless-stopped
+    read_only: true
+    depends_on:
+      provision-postgres:
+        condition: service_completed_successfully
+      provision-valkey:
+        condition: service_completed_successfully
+      otel-collector:
+        condition: service_started
+    environment:
+      IDENTITY_ISSUER: ${IDENTITY_ISSUER:?Set IDENTITY_ISSUER in the env file}
+      IDENTITY_CLIENTS_FILE: /etc/identity/clients.yaml
+      IDENTITY_SECRETS__MASTER_KEY_FILE: /run/secrets/identity_master_key
+      IDENTITY_SECRETS__MASTER_KEY_ID: ${IDENTITY_MASTER_KEY_ID:?Set IDENTITY_MASTER_KEY_ID in the env file}
+      IDENTITY_DATABASE__URL: postgres://identity:${IDENTITY_DB_PASSWORD_URLENCODED:?Set IDENTITY_DB_PASSWORD_URLENCODED}@postgres:5432/identity?sslmode=disable
+      IDENTITY_DATABASE__NAME: identity
+      IDENTITY_VALKEY__ADDRESS: valkey:6379
+      IDENTITY_VALKEY__USERNAME: identity
+      IDENTITY_VALKEY__PASSWORD: ${IDENTITY_VALKEY_PASSWORD:?Set IDENTITY_VALKEY_PASSWORD in the env file}
+      IDENTITY_VALKEY__KEY_PREFIX: identity
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    secrets:
+      - identity_master_key
+    volumes:
+      - ./config/identity/clients.yaml:/etc/identity/clients.yaml:ro
+    # Only the public port. The admin port 9090 stays unpublished.
+    ports:
+      - "${IDENTITY_BIND:-127.0.0.1}:${IDENTITY_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "/identity", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 30s
+    networks:
+      - services
+
 # Two networks (finding R4 of the PR review). Only the collector is on both.
 # A business service joins "services". It cannot reach Loki, Tempo, or Prometheus.
 networks:
   services:
   observability:
+
+# The master key file of identity. The file keeps its owner and mode (see docs/compose.md).
+secrets:
+  identity_master_key:
+    file: ${IDENTITY_MASTER_KEY_FILE:?Set IDENTITY_MASTER_KEY_FILE in the env file}
 
 volumes:
   postgres-data:
