@@ -41,6 +41,12 @@ cleanup() {
     rm -rf "$key_dir"
   fi
   local containers volumes
+  if [ -n "$key_dir" ] && [ -e "$key_dir" ]; then
+    echo "FAIL: I16: the temporary key folder stays after the cleanup"
+    code=1
+  elif [ -n "$key_dir" ]; then
+    echo "ok: I16: the temporary key folder is removed"
+  fi
   containers="$(docker ps -aq --filter "label=com.docker.compose.project=$project")"
   volumes="$(docker volume ls -q --filter "label=com.docker.compose.project=$project")"
   if [ -n "$containers$volumes" ]; then
@@ -436,6 +442,23 @@ svc_get() {
   dc exec -T postgres wget -q -T 10 -O - "$1"
 }
 
+# I30: the URL-encoded database password decodes to the database password. The password has
+# characters that need encoding, so a wrong encoded value stops identity from connecting.
+test_identity_password_encoding() {
+  local plain encoded decoded
+  plain="$(envval IDENTITY_DB_PASSWORD)"
+  encoded="$(envval IDENTITY_DB_PASSWORD_URLENCODED)"
+  if [ "$plain" = "$encoded" ]; then
+    echo "the test password does not need encoding"
+    return 1
+  fi
+  decoded="$(printf '%b' "${encoded//%/\\x}")"
+  if [ "$decoded" != "$plain" ]; then
+    echo "the encoded password does not decode to IDENTITY_DB_PASSWORD"
+    return 1
+  fi
+}
+
 # I25: the JWKS has one public ES256 key and no private part.
 test_identity_jwks() {
   local jwks count
@@ -551,6 +574,7 @@ run_check "I13: Grafana health and data sources" test_grafana
 run_check "I14: Grafana without credentials" test_grafana_anonymous
 run_check "I15: no password in provisioning logs" test_no_password_in_logs
 
+run_check "I30: identity database password encoding" test_identity_password_encoding
 run_check "I25: identity JWKS" test_identity_jwks
 run_check "I26: identity discovery document" test_identity_discovery
 run_check "I27: identity setup link record" test_identity_setup_log

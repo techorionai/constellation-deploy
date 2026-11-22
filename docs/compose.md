@@ -16,9 +16,11 @@
 
    ```sh
    install -d -m 0700 secrets
+   chmod 0700 secrets
    openssl rand -base64 32 > secrets/identity-master-key
-   chmod 0444 secrets/identity-master-key
    ```
+
+   Then set the owner and the mode of the file (see "Master key").
 
 5. Start the base: `docker compose up -d`.
 6. Examine the states: `docker compose ps`. The services `postgres`, `valkey`, `prometheus`, `grafana`, and `identity` show `healthy`. The collector, Loki, and Tempo show `running`, because their images have no shell for a health check. The services `provision-postgres` and `provision-valkey` show `exited (0)`.
@@ -45,7 +47,8 @@ All settings are in `.env`. Compose reads `.env` in the project folder. The vari
 | `IDENTITY_ISSUER` | none | Public URL of identity, as browsers use it. It must agree with `IDENTITY_BIND` and `IDENTITY_PORT`. |
 | `IDENTITY_MASTER_KEY_FILE` | none | Path of the master key file on the host. |
 | `IDENTITY_MASTER_KEY_ID` | none | ID of the master key. It is not a secret. |
-| `IDENTITY_BIND`, `IDENTITY_PORT` | `127.0.0.1`, `8080` | Host IP and host port of identity. |
+| `IDENTITY_BIND`, `IDENTITY_PORT` | `127.0.0.1`, `8080` | Host IP and host port of identity. Keep the bind on loopback unless a TLS reverse proxy runs on the same host. |
+| `IDENTITY_TRUSTED_PROXIES` | empty | CIDR list of the reverse proxies in front of identity. Set it when you use a proxy (see "Identity"). |
 | `PROMETHEUS_RETENTION` | `15d` | Retention of metrics. |
 | `LOKI_RETENTION` | `168h` | Retention of logs. |
 | `TEMPO_RETENTION` | `72h` | Retention of traces. |
@@ -83,20 +86,28 @@ The master key encrypts the signing keys of identity in the database. Make the k
 
 ```sh
 install -d -m 0700 secrets
+chmod 0700 secrets
 openssl rand -base64 32 > secrets/identity-master-key
-chmod 0444 secrets/identity-master-key
 ```
 
-- Set `IDENTITY_MASTER_KEY_FILE` in `.env` to the path of the file. The default value is `./secrets/identity-master-key`.
-- Set `IDENTITY_MASTER_KEY_ID` to an ID that matches `^[a-z0-9-]{1,32}$`. The default value is `identity-1`. The ID is not a secret.
-- The container user has the UID 65532. Compose mounts the file and keeps the owner and the mode of the host file. Thus the file has the mode `0444`. The folder `secrets/` has the mode `0700`, so other users of the host cannot open the file. Git ignores `secrets/`.
+The command `install -d -m 0700` does not change the mode of a folder that exists. The command `chmod 0700 secrets` does.
+
+- Set `IDENTITY_MASTER_KEY_FILE` in `.env` to the path of the file. `.env.example` has the value `./secrets/identity-master-key`.
+- Set `IDENTITY_MASTER_KEY_ID` to an ID that matches `^[a-z0-9-]{1,32}$`. `.env.example` has the value `identity-1`. The ID is not a secret.
+- The container user has the UID 65532. Compose mounts the file and keeps the owner and the mode of the host file.
+- On Linux, give the file to the container user and make it read-only: `sudo chown 65532:65532 secrets/identity-master-key` and `chmod 0400 secrets/identity-master-key`. Then only the container user (and root) can read the key.
+- Use the fallback `chmod 0444 secrets/identity-master-key` only where you cannot change the owner, for example Docker Desktop. Each user of the host who can open the file can then read the key. The mode `0700` of the folder `secrets/` is the only control. Check that the folder has this mode.
+- Git ignores `secrets/`.
 - Keep a copy of the key in a safe place. If the key is lost, all signing keys and secrets in the database are unreadable. Identity then stops at the start with a message. The operator runs `identity rotate-signing-keys --force` to make new signing keys.
 
 ### Issuer, port, and clients file
 
-- `IDENTITY_ISSUER` is the public URL that browsers use. The default is `http://localhost:8080`. It must agree with `IDENTITY_BIND` and `IDENTITY_PORT`. Identity accepts an `http` issuer only for `localhost`, `127.0.0.1`, and `[::1]`.
+- `IDENTITY_ISSUER` is the public URL that browsers use. `.env.example` has the value `http://localhost:8080`. It must agree with `IDENTITY_BIND` and `IDENTITY_PORT`. Identity accepts an `http` issuer only for `localhost`, `127.0.0.1`, and `[::1]`.
 - The public port is `${IDENTITY_BIND:-127.0.0.1}:${IDENTITY_PORT:-8080}`. The admin port `9090` is not published.
 - A host other than `localhost` needs TLS. The session cookie has the flag `Secure`, and the issuer rule needs `https`. TLS is out of scope for this repository. Use a TLS reverse proxy.
+- Keep `IDENTITY_BIND` on `127.0.0.1` unless a TLS reverse proxy runs on the same host. With `IDENTITY_BIND=0.0.0.0` and an `http://localhost` issuer, identity serves plain HTTP on all interfaces. Tokens and client assertions then go on the network in plain text. A port that Docker publishes also bypasses host firewalls such as `ufw`.
+- With a reverse proxy, set `IDENTITY_TRUSTED_PROXIES` in `.env` to the CIDR of the proxy. Identity then uses `X-Forwarded-For` from the proxy. If you do not set it, identity sees the proxy address as the client address of all users. They then share one login lockout (50 failures in 15 minutes), and the audit log has the proxy address.
+- The values of `IDENTITY_DB_PASSWORD_URLENCODED` and `IDENTITY_VALKEY_PASSWORD` are plain environment values of the container. A user of `docker inspect` can read them. Such a user has Docker access, which is almost root. The base services do the same for their admin passwords. Identity has no `_FILE` form for these values. This is a known limit.
 - `config/identity/clients.yaml` is the clients file. It has `clients: []`. When a service needs a client, add it to this file and restart `identity`.
 - The `AllowInsecureHTTP` options of the services that call identity are for local Compose only (see "Add a service"). Production uses `https` and keeps the options `false`.
 
@@ -172,8 +183,27 @@ Values for a service that calls identity. Add the lines that the service needs t
       # A service that verifies tokens with auth/jwt of platform-go.
       <SVC>_AUTH__ISSUER: ${IDENTITY_ISSUER}
       <SVC>_AUTH__JWKS_URL: http://identity:8080/.well-known/jwks.json
+      # The audience of the service. Use the name of the service. Never use "identity".
+      <SVC>_AUTH__AUDIENCE: <svc>
       # Local Compose only. The issuer and the JWKS URL use http here. In production, both use https and this stays false.
       <SVC>_AUTH__ALLOW_INSECURE_HTTP: "true"
+      # Client values for auth/clientcred. The ID and the key ID come from the entry of the service in clients.yaml.
+      <SVC>_CLIENT__ID: <client id>
+      <SVC>_CLIENT__KEY_ID: <key id>
+      <SVC>_CLIENT__PRIVATE_KEY_FILE: /run/secrets/<svc>_client_key
+```
+
+Give the private key of the client as a Compose secret. Never put the key in `.env` or in an `environment` value, because `docker inspect` shows it. Add this to the service block and to the top level of `compose.yaml`. Keep the key file in the folder `secrets/` with the owner of the service and the mode `0400`:
+
+```yaml
+    # In the service block:
+    secrets:
+      - <svc>_client_key
+
+# At the top level:
+secrets:
+  <svc>_client_key:
+    file: ./secrets/<svc>-client-key.pem
 ```
 
 Each of the three `ALLOW_INSECURE_HTTP` options is necessary in local Compose. The libraries return an error at the start if a URL does not use `https` and the option is not `true`. The libraries do not follow redirects. The `identity` service does not need these options. It sets its own option from the loopback rule of `IDENTITY_ISSUER`. A client assertion for identity has the issuer `IDENTITY_ISSUER` as `aud`, and not the token URL.
@@ -212,7 +242,7 @@ bash tests/check-compose-cases.sh    # Negative cases of the static checks.
 bash scripts/smoke-test.sh           # Live containers. Takes some minutes.
 ```
 
-Check 5 of `scripts/check-compose.sh` requires the value `change-me` for each variable in `.env.example` that has `PASSWORD`, `SECRET`, `TOKEN`, or `KEY` in its name. A name that ends in `_FILE` or `_ID` (for example `IDENTITY_MASTER_KEY_FILE` and `IDENTITY_MASTER_KEY_ID`) can have any value. The suffix must be exact.
+Check 5 of `scripts/check-compose.sh` requires the value `change-me` for each variable in `.env.example` that has `PASSWORD`, `SECRET`, `TOKEN`, or `KEY` in its name. Only the two exact names `IDENTITY_MASTER_KEY_FILE` and `IDENTITY_MASTER_KEY_ID` can have any value. A name with the suffix `_FILE` or `_ID` is not exempt.
 
 Run `scripts/smoke-test.sh` directly on the host, not under `act`. A relative bind mount does not work under `act` with a Docker Desktop host. The script uses the project name `constellation-smoke` and the values of `tests/smoke.env`. The values in this file are for tests only. The script removes its containers and volumes at the end.
 

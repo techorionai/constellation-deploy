@@ -11,8 +11,10 @@ cp .env.example .env
 # Replace each "change-me" value in .env.
 # Make the master key of identity.
 install -d -m 0700 secrets
+chmod 0700 secrets
 openssl rand -base64 32 > secrets/identity-master-key
-chmod 0444 secrets/identity-master-key
+# On Linux: sudo chown 65532:65532 secrets/identity-master-key && chmod 0400 secrets/identity-master-key
+# Where you cannot change the owner: chmod 0444 secrets/identity-master-key (see docs/compose.md).
 docker compose up -d
 docker compose ps
 ```

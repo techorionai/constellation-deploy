@@ -232,6 +232,8 @@ services:
       IDENTITY_VALKEY__USERNAME: identity
       IDENTITY_VALKEY__PASSWORD: ${IDENTITY_VALKEY_PASSWORD:?Set IDENTITY_VALKEY_PASSWORD in the env file}
       IDENTITY_VALKEY__KEY_PREFIX: identity
+      # CIDR list of the reverse proxies in front of identity. Empty means no proxy.
+      IDENTITY_HTTP__TRUSTED_PROXIES: ${IDENTITY_TRUSTED_PROXIES:-}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
     secrets:
       - identity_master_key
