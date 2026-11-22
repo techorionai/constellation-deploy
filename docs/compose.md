@@ -5,16 +5,24 @@
 ## Requirements
 
 - Docker Engine with Docker Compose 2.38 or later.
-- `openssl` to make passwords (optional).
+- `openssl` to make passwords and the master key of identity.
 
 ## Install
 
 1. Copy the example file: `cp .env.example .env`.
 2. Protect the file: `chmod 600 .env`.
-3. Replace each `change-me` value in `.env` with a new password. To make a password, run `openssl rand -base64 32`. The containers reject the placeholder `change-me` and each password with fewer than 12 characters, and they do not start. This includes `GRAFANA_SECRET_KEY`.
-4. Start the base: `docker compose up -d`.
-5. Examine the states: `docker compose ps`. The services `postgres`, `valkey`, `prometheus`, and `grafana` show `healthy`. The collector, Loki, and Tempo show `running`, because their images have no shell for a health check. The services `provision-postgres` and `provision-valkey` show `exited (0)`.
-6. Open Grafana at `http://127.0.0.1:3000`. Log in with `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD`.
+3. Replace each `change-me` value in `.env` with a new password. To make a password, run `openssl rand -base64 32`. The containers reject the placeholder `change-me` and each password with fewer than 12 characters, and they do not start. This includes `GRAFANA_SECRET_KEY`. Set `IDENTITY_DB_PASSWORD_URLENCODED` to the URL-encoded form of `IDENTITY_DB_PASSWORD`. A password from `openssl rand -base64 32` can have the characters `+`, `/`, and `=`, so encode it.
+4. Make the master key of identity (see "Identity"):
+
+   ```sh
+   install -d -m 0700 secrets
+   openssl rand -base64 32 > secrets/identity-master-key
+   chmod 0444 secrets/identity-master-key
+   ```
+
+5. Start the base: `docker compose up -d`.
+6. Examine the states: `docker compose ps`. The services `postgres`, `valkey`, `prometheus`, `grafana`, and `identity` show `healthy`. The collector, Loki, and Tempo show `running`, because their images have no shell for a health check. The services `provision-postgres` and `provision-valkey` show `exited (0)`.
+7. Open Grafana at `http://127.0.0.1:3000`. Log in with `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD`.
 
 Use `docker compose up -d` and not `docker compose up -d --wait` for the base. Compose 5 returns an error for `--wait` when a one-shot service exits and no other service depends on it. A service block that depends on both provisioning services (see "Add a service") works with `--wait`.
 
@@ -33,6 +41,11 @@ All settings are in `.env`. Compose reads `.env` in the project folder. The vari
 | `GRAFANA_SECRET_KEY` | none | Key that Grafana uses to encrypt the secrets in its database. A change later makes the stored data source secrets unreadable. |
 | `SERVICE_DB_CONNECTION_LIMIT` | `50` | Maximum number of connections for each service role in PostgreSQL. Keep the number of services times this value lower than `POSTGRES_MAX_CONNECTIONS`. |
 | `GRAFANA_BIND`, `GRAFANA_PORT` | `127.0.0.1`, `3000` | Host IP and host port of Grafana. |
+| `IDENTITY_DB_PASSWORD`, `IDENTITY_DB_PASSWORD_URLENCODED`, `IDENTITY_VALKEY_PASSWORD` | none | Database and Valkey passwords of identity. The second value is the URL-encoded form of the first. |
+| `IDENTITY_ISSUER` | none | Public URL of identity, as browsers use it. It must agree with `IDENTITY_BIND` and `IDENTITY_PORT`. |
+| `IDENTITY_MASTER_KEY_FILE` | none | Path of the master key file on the host. |
+| `IDENTITY_MASTER_KEY_ID` | none | ID of the master key. It is not a secret. |
+| `IDENTITY_BIND`, `IDENTITY_PORT` | `127.0.0.1`, `8080` | Host IP and host port of identity. |
 | `PROMETHEUS_RETENTION` | `15d` | Retention of metrics. |
 | `LOKI_RETENTION` | `168h` | Retention of logs. |
 | `TEMPO_RETENTION` | `72h` | Retention of traces. |
@@ -45,7 +58,7 @@ Grafana does not send requests to third parties. The news feed, Gravatar, the pl
 
 ## Ports
 
-Only Grafana publishes a host port. It uses `${GRAFANA_BIND:-127.0.0.1}:${GRAFANA_PORT:-3000}`. To reach Grafana from other hosts, set `GRAFANA_BIND` and put a TLS reverse proxy in front of it. TLS is out of scope for this repository.
+Grafana and identity publish a host port. Grafana uses `${GRAFANA_BIND:-127.0.0.1}:${GRAFANA_PORT:-3000}`. Identity uses `${IDENTITY_BIND:-127.0.0.1}:${IDENTITY_PORT:-8080}` for its public port. To reach them from other hosts, set the bind variable and put a TLS reverse proxy in front. Identity needs TLS for a host other than `localhost` (see "Identity"). TLS is out of scope for this repository.
 
 Do not publish other ports. This includes the OTLP ports of the collector (4317 and 4318) and the admin port of each platform service (`:9090` with `/livez` and `/readyz`). A service in the `services` network reaches the collector at `http://otel-collector:4318`.
 
@@ -53,12 +66,49 @@ Do not publish other ports. This includes the OTLP ports of the collector (4317 
 
 The base has two networks.
 
-- `services` has `postgres`, `valkey`, the two provisioning services, `otel-collector`, and each later platform service.
+- `services` has `postgres`, `valkey`, the two provisioning services, `otel-collector`, `identity`, and each later platform service.
 - `observability` has `otel-collector`, `prometheus`, `loki`, `tempo`, and `grafana`.
 
 Only the collector is on both networks. A platform service cannot reach Loki, Tempo, or Prometheus, so it cannot read the telemetry of other services. The observability containers cannot reach PostgreSQL or Valkey.
 
 Limit: Loki, Tempo, Prometheus, and the collector have no authentication. A platform service can still send false telemetry to the collector, also under the `service.name` of another service. Do not trust the `service.name` of a record as proof of its source.
+
+## Identity
+
+The service `identity` is the identity provider of the platform. It uses the image `ghcr.io/techorionai/constellation-identity:0.1.0`. It uses the database `identity` and the Valkey user `identity` that the provisioning services make from the name `identity` in `CONSTELLATION_SERVICES`.
+
+### Master key
+
+The master key encrypts the signing keys of identity in the database. Make the key file on the host before the first start:
+
+```sh
+install -d -m 0700 secrets
+openssl rand -base64 32 > secrets/identity-master-key
+chmod 0444 secrets/identity-master-key
+```
+
+- Set `IDENTITY_MASTER_KEY_FILE` in `.env` to the path of the file. The default value is `./secrets/identity-master-key`.
+- Set `IDENTITY_MASTER_KEY_ID` to an ID that matches `^[a-z0-9-]{1,32}$`. The default value is `identity-1`. The ID is not a secret.
+- The container user has the UID 65532. Compose mounts the file and keeps the owner and the mode of the host file. Thus the file has the mode `0444`. The folder `secrets/` has the mode `0700`, so other users of the host cannot open the file. Git ignores `secrets/`.
+- Keep a copy of the key in a safe place. If the key is lost, all signing keys and secrets in the database are unreadable. Identity then stops at the start with a message. The operator runs `identity rotate-signing-keys --force` to make new signing keys.
+
+### Issuer, port, and clients file
+
+- `IDENTITY_ISSUER` is the public URL that browsers use. The default is `http://localhost:8080`. It must agree with `IDENTITY_BIND` and `IDENTITY_PORT`. Identity accepts an `http` issuer only for `localhost`, `127.0.0.1`, and `[::1]`.
+- The public port is `${IDENTITY_BIND:-127.0.0.1}:${IDENTITY_PORT:-8080}`. The admin port `9090` is not published.
+- A host other than `localhost` needs TLS. The session cookie has the flag `Secure`, and the issuer rule needs `https`. TLS is out of scope for this repository. Use a TLS reverse proxy.
+- `config/identity/clients.yaml` is the clients file. It has `clients: []`. When a service needs a client, add it to this file and restart `identity`.
+- The `AllowInsecureHTTP` options of the services that call identity are for local Compose only (see "Add a service"). Production uses `https` and keeps the options `false`.
+
+### First admin
+
+At the first start, identity writes one log record with the message `identity: first-admin setup link pending`. The record says that a setup link exists. The log never has the link, because a person who can read the log could take over the install. To get the link, run:
+
+```sh
+docker compose exec identity /identity setup-link
+```
+
+The command prints the link and deletes the earlier unused links. Run it again to get a new link. If an admin exists, it prints an error. Do not put the link in a log, a ticket, or a chat.
 
 ## Provisioning
 
@@ -78,11 +128,11 @@ The scripts do not print passwords, and they do not put passwords on a command l
 3. Add a service block to `compose.yaml` (the template below).
 4. Run the provisioning services: `docker compose run --rm provision-postgres` and `docker compose run --rm provision-valkey`. Then run `docker compose up -d`. Use `docker compose run --rm` because `docker compose up -d` does not start an exited one-shot container again when its configuration did not change.
 
-Template for a service `identity`. Replace `identity` and `IDENTITY` with the name of the service. URL-encode the password in `DATABASE__URL`. A platform service joins the `services` network only. Add the same hardening as the base services.
+Template for a service `identity`. Use the exact version tag of the image in place of `<version>` (for example `0.1.0`). Replace `identity` and `IDENTITY` with the name of the service. URL-encode the password in `DATABASE__URL`. A platform service joins the `services` network only. Add the same hardening as the base services.
 
 ```yaml
   identity:
-    image: ghcr.io/techorionai/constellation-identity:1.2.3
+    image: ghcr.io/techorionai/constellation-identity:<version>
     restart: unless-stopped
     depends_on:
       provision-postgres:
@@ -106,6 +156,27 @@ Template for a service `identity`. Replace `identity` and `IDENTITY` with the na
     networks:
       - services
 ```
+
+Values for a service that calls identity. Add the lines that the service needs to its `environment`. Replace `<SVC>` with the upper case name of the service.
+
+```yaml
+      # A service that gets tokens with auth/clientcred of platform-go.
+      <SVC>_CLIENT__ISSUER: ${IDENTITY_ISSUER}
+      <SVC>_CLIENT__TOKEN_URL: http://identity:8080/oauth/token
+      # Local Compose only. The issuer and the token URL use http here. In production, both use https and this stays false.
+      <SVC>_CLIENT__ALLOW_INSECURE_HTTP: "true"
+      # A service that calls the identity API with clients/identity of platform-go.
+      <SVC>_IDENTITY__URL: http://identity:8080
+      # Local Compose only. In production, the URL uses https and this stays false.
+      <SVC>_IDENTITY__ALLOW_INSECURE_HTTP: "true"
+      # A service that verifies tokens with auth/jwt of platform-go.
+      <SVC>_AUTH__ISSUER: ${IDENTITY_ISSUER}
+      <SVC>_AUTH__JWKS_URL: http://identity:8080/.well-known/jwks.json
+      # Local Compose only. The issuer and the JWKS URL use http here. In production, both use https and this stays false.
+      <SVC>_AUTH__ALLOW_INSECURE_HTTP: "true"
+```
+
+Each of the three `ALLOW_INSECURE_HTTP` options is necessary in local Compose. The libraries return an error at the start if a URL does not use `https` and the option is not `true`. The libraries do not follow redirects. The `identity` service does not need these options. It sets its own option from the loopback rule of `IDENTITY_ISSUER`. A client assertion for identity has the issuer `IDENTITY_ISSUER` as `aud`, and not the token URL.
 
 Add `IDENTITY_DB_PASSWORD_URLENCODED` to `.env` with the URL-encoded form of `IDENTITY_DB_PASSWORD`.
 
@@ -140,6 +211,8 @@ bash scripts/check-compose.sh        # Static checks. No container runs.
 bash tests/check-compose-cases.sh    # Negative cases of the static checks.
 bash scripts/smoke-test.sh           # Live containers. Takes some minutes.
 ```
+
+Check 5 of `scripts/check-compose.sh` requires the value `change-me` for each variable in `.env.example` that has `PASSWORD`, `SECRET`, `TOKEN`, or `KEY` in its name. A name that ends in `_FILE` or `_ID` (for example `IDENTITY_MASTER_KEY_FILE` and `IDENTITY_MASTER_KEY_ID`) can have any value. The suffix must be exact.
 
 Run `scripts/smoke-test.sh` directly on the host, not under `act`. A relative bind mount does not work under `act` with a Docker Desktop host. The script uses the project name `constellation-smoke` and the values of `tests/smoke.env`. The values in this file are for tests only. The script removes its containers and volumes at the end.
 
