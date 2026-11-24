@@ -78,7 +78,7 @@ Limit: Loki, Tempo, Prometheus, and the collector have no authentication. A plat
 
 ## Identity
 
-The service `identity` is the identity provider of the platform. It uses the image `ghcr.io/techorionai/constellation-identity:0.1.0`. It uses the database `identity` and the Valkey user `identity` that the provisioning services make from the name `identity` in `CONSTELLATION_SERVICES`.
+The service `identity` is the identity provider of the platform. It uses the image `ghcr.io/techorionai/constellation-identity:0.2.0`. It uses the database `identity` and the Valkey user `identity` that the provisioning services make from the name `identity` in `CONSTELLATION_SERVICES`.
 
 ### Master key
 
