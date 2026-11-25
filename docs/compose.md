@@ -78,7 +78,7 @@ Limit: Loki, Tempo, Prometheus, and the collector have no authentication. A plat
 
 ## Identity
 
-The service `identity` is the identity provider of the platform. It uses the image `ghcr.io/techorionai/constellation-identity:0.2.0`. It uses the database `identity` and the Valkey user `identity` that the provisioning services make from the name `identity` in `CONSTELLATION_SERVICES`.
+The service `identity` is the identity provider of the platform. It uses the image `ghcr.io/techorionai/constellation-identity:0.3.0`. It uses the database `identity` and the Valkey user `identity` that the provisioning services make from the name `identity` in `CONSTELLATION_SERVICES`.
 
 ### Master key
 
@@ -108,6 +108,9 @@ The command `install -d -m 0700` does not change the mode of a folder that exist
 - Keep `IDENTITY_BIND` on `127.0.0.1` unless a TLS reverse proxy runs on the same host. With `IDENTITY_BIND=0.0.0.0` and an `http://localhost` issuer, identity serves plain HTTP on all interfaces. Tokens and client assertions then go on the network in plain text. A port that Docker publishes also bypasses host firewalls such as `ufw`.
 - With a reverse proxy, set `IDENTITY_TRUSTED_PROXIES` in `.env` to the CIDR of the proxy. Identity then uses `X-Forwarded-For` from the proxy. If you do not set it, identity sees the proxy address as the client address of all users. They then share one login lockout (50 failures in 15 minutes), and the audit log has the proxy address.
 - The values of `IDENTITY_DB_PASSWORD_URLENCODED` and `IDENTITY_VALKEY_PASSWORD` are plain environment values of the container. A user of `docker inspect` can read them. Such a user has Docker access, which is almost root. The base services do the same for their admin passwords. Identity has no `_FILE` form for these values. This is a known limit.
+- Identity limits the requests to its public endpoints with counters in Valkey. Valkey must be healthy. Most limits fail closed with status 503 when Valkey is down. The service starts after `provision-valkey` completes. The defaults need no setting. `IDENTITY_RATE_LIMIT__ENABLED` and `IDENTITY_RATE_LIMIT__<BUCKET>__LIMIT` are optional.
+- The limits use the client IP. Behind a proxy without `IDENTITY_TRUSTED_PROXIES`, all clients share the limits of the proxy address. Each trusted proxy must append the address of its peer to `X-Forwarded-For`.
+- To remove the login lock of one email, run `docker compose exec identity /identity unlock-login <email>`.
 - `config/identity/clients.yaml` is the clients file. It has `clients: []`. When a service needs a client, add it to this file and restart `identity`.
 - The `AllowInsecureHTTP` options of the services that call identity are for local Compose only (see "Add a service"). Production uses `https` and keeps the options `false`.
 

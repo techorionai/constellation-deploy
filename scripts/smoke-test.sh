@@ -525,6 +525,35 @@ test_identity_no_secret_in_logs() {
   fi
 }
 
+# I31: the rate limit of GET /setup. The bucket setup_invite gives 10 requests in 15 minutes for one
+# IP. Request 11 must get 429 and a Retry-After header. The requests have a bad token and no
+# Sec-Fetch-* header, so the cross-site check of identity does not give 403. This is the only
+# check that calls /setup.
+test_identity_setup_rate_limit() {
+  local i out code
+  for i in 1 2 3 4 5 6 7 8 9 10 11; do
+    # BusyBox wget does not print all headers of an error response. Thus the request is raw HTTP
+    # through nc in the postgres container, which is in the network "services". The sleep keeps
+    # the connection open. Without it, nc closes the connection and identity cancels the request.
+    out="$(dc exec -T postgres sh -c \
+      "(printf 'GET /setup?token=smoke-bad-token HTTP/1.0\r\nHost: identity:8080\r\n\r\n'; sleep 1) | nc -w 5 identity 8080" \
+      2>&1 | tr -d '\r')" || true
+    code="$(printf '%s\n' "$out" | sed -n 's/^ *HTTP\/[0-9.]* \([0-9]*\).*/\1/p' | head -n 1)"
+    if [ "$i" -le 10 ] && [ "$code" = "429" ]; then
+      echo "request $i got 429 before the limit"
+      return 1
+    fi
+  done
+  if [ "$code" != "429" ]; then
+    echo "request 11 got status $code, expected 429"
+    return 1
+  fi
+  if ! printf '%s\n' "$out" | grep -iEq '^retry-after: *[0-9]+'; then
+    echo "request 11 has no Retry-After header: $out"
+    return 1
+  fi
+}
+
 make_master_key || { echo "FAIL: the master key of identity"; exit 1; }
 
 # Remove a project of an earlier run.
@@ -585,6 +614,7 @@ run_check "I28b: identity Valkey user cannot read another prefix" \
 run_check "I28c: identity Valkey user can write its prefix" \
   expect_exact OK vk identity "$(envval IDENTITY_VALKEY_PASSWORD)" SET identity:smoke 1
 run_check "I29: no secret in the identity log" test_identity_no_secret_in_logs
+run_check "I31: identity rate limit of GET /setup" test_identity_setup_rate_limit
 
 if [ "${#failures[@]}" -ne 0 ]; then
   echo "smoke-test: ${#failures[@]} check(s) failed: ${failures[*]}"
