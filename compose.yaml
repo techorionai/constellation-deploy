@@ -211,7 +211,7 @@ services:
 
   identity:
     <<: *hardened
-    image: ghcr.io/techorionai/constellation-identity:0.4.0
+    image: ghcr.io/techorionai/constellation-identity:0.5.0
     restart: unless-stopped
     read_only: true
     depends_on:
