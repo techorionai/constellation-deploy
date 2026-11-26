@@ -250,7 +250,7 @@ bash scripts/new-service-client.sh [--secrets-dir DIR] [--clients-file FILE] [--
 - Run the script before `docker compose up -d`. Compose mounts the clients file with `create_host_path: false`. If the file does not exist, Docker refuses the mount and makes no directory. Docker Desktop on Windows can make a directory at the missing path and ignore this option. Identity then stops with the error "is a directory". Remove the directory and run the script.
 - The script prints the next steps. They are the key owner, the two variables of the service in `.env` (`<SVC>_CLIENT_KEY_FILE` and `<SVC>_CLIENT_KEY_ID`), and a restart of identity.
 
-Key owner and mode: the container user has the UID 65532. A Compose file secret keeps the owner and the mode of the host file. On Linux, run `sudo chown 65532:65532 secrets/<svc>-client-key.pem`. The script does not use `sudo`. On Docker Desktop, where you cannot change the owner, use `chmod 0444` on the key file. Keep the mode `0700` on the folder `secrets/`. That mode is then the only control.
+Key owner and mode: the container user has the UID 65532. A Compose file secret keeps the owner and the mode of the host file. On Linux, run `sudo chown 65532:65532 secrets/<svc>-client-key.pem`. The script does not use `sudo`. On Docker Desktop, where you cannot change the owner, use `chmod 0444` on the key file. Keep the mode `0700` on the folder `secrets/`. That mode is then the only control. The script stops if the folder has a permission for group or other.
 
 Rotation of a key:
 

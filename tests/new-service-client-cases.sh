@@ -60,7 +60,7 @@ for name in Bad-Name default identity ""; do
 done
 if [ "$ok" -eq 1 ] && [ ! -e "$d/s" ]; then pass "U4: bad names"; else fail "U4: bad names" "a bad name was accepted or a file was made"; fi
 d="$(fresh)"
-mkdir "$d/s"
+mkdir -m 0700 "$d/s"
 echo old > "$d/s/helpdesk-client-key.pem"
 if ! run "$d" --secrets-dir s helpdesk >/dev/null && [ "$(cat "$d/s/helpdesk-client-key.pem")" = old ] \
   && [ ! -e "$d/s/identity-clients.yaml" ]; then
@@ -119,7 +119,7 @@ fi
 
 # U8: the forms "clients: []" and a block list.
 d="$(fresh)"
-mkdir "$d/s"
+mkdir -m 0700 "$d/s"
 printf '# Comment line\nclients: []\n' > "$d/s/identity-clients.yaml"
 if run "$d" --secrets-dir s helpdesk >/dev/null \
   && [ "$(sed -n 1p "$d/s/identity-clients.yaml")" = "# Comment line" ] \
@@ -131,7 +131,7 @@ else
   fail "U8: empty list" "$(cat "$d/s/identity-clients.yaml")"
 fi
 d="$(fresh)"
-mkdir "$d/s"
+mkdir -m 0700 "$d/s"
 old='clients:
   - id: other
     app: other
@@ -149,7 +149,7 @@ fi
 
 # U9: a flow list is refused. The file does not change.
 d="$(fresh)"
-mkdir "$d/s"
+mkdir -m 0700 "$d/s"
 printf 'clients: [{id: x, app: x}]\n' > "$d/s/identity-clients.yaml"
 if ! run "$d" --secrets-dir s helpdesk >/dev/null \
   && [ "$(cat "$d/s/identity-clients.yaml")" = 'clients: [{id: x, app: x}]' ] \
