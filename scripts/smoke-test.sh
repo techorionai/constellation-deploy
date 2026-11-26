@@ -511,6 +511,15 @@ test_identity_setup_log() {
 test_identity_no_secret_in_logs() {
   local logs value name
   logs="$(dc logs identity 2>&1)" || return 1
+  # I35 stores a test client secret. It must not be in the log, and not in the stderr of I35.
+  if printf '%s' "$logs" | grep -qF -- "$idp_test_secret"; then
+    echo "the log has the test client secret"
+    return 1
+  fi
+  if [ -f "$key_dir/idp-stderr" ] && grep -qF -- "$idp_test_secret" "$key_dir/idp-stderr"; then
+    echo "the stderr of set-idp-secret has the test client secret"
+    return 1
+  fi
   for name in IDENTITY_DB_PASSWORD IDENTITY_VALKEY_PASSWORD; do
     value="$(envval "$name")"
     if printf '%s' "$logs" | grep -qF -- "$value"; then
@@ -552,6 +561,127 @@ test_identity_setup_rate_limit() {
     echo "request 11 has no Retry-After header: $out"
     return 1
   fi
+}
+
+# Test value for the client secret of check I35. It is for tests only. I29 looks for it in the log.
+idp_test_secret="smoke-idp-secret-0123456789"
+
+# A raw HTTP GET to identity from the container postgres, which is in the network "services".
+# The output has the status line, the headers, and the body. BusyBox wget does not print the
+# headers of an error response, so the request goes through nc (see I31).
+identity_raw_get() {
+  dc exec -T postgres sh -c \
+    "(printf 'GET $1 HTTP/1.0\r\nHost: identity:8080\r\n\r\n'; sleep 1) | nc -w 5 identity 8080" \
+    2>&1 | tr -d '\r'
+}
+
+# The HTTP status code of a response of identity_raw_get.
+http_code() {
+  printf '%s\n' "$1" | sed -n 's/^ *HTTP\/[0-9.]* \([0-9]*\).*/\1/p' | head -n 1
+}
+
+# I32: the login page gives 200 and has no link to an upstream login (no provider is set).
+test_identity_login_no_provider() {
+  local out
+  out="$(identity_raw_get /login)"
+  if [ "$(http_code "$out")" != "200" ]; then
+    echo "GET /login did not give 200: $(printf '%s\n' "$out" | head -n 1)"
+    return 1
+  fi
+  if printf '%s' "$out" | grep -qF '/login/oidc/'; then
+    echo "the login page has a link to /login/oidc/ with no provider set"
+    return 1
+  fi
+}
+
+# I33: the login page has the CSP script-src 'self'. Passkeys are on, because the issuer host is localhost.
+test_identity_login_csp() {
+  local out
+  out="$(identity_raw_get /login)"
+  if ! printf '%s\n' "$out" | grep -iE '^content-security-policy:' | grep -qF "script-src 'self'"; then
+    echo "the login page has no CSP with script-src 'self'"
+    printf '%s\n' "$out" | head -n 20
+    return 1
+  fi
+}
+
+# I34: the command unlock-login for an email that is not locked.
+test_identity_unlock_login() {
+  # The command logs to stderr. The result is on stdout.
+  local out code
+  out="$(dc exec -T identity /identity unlock-login nobody@example.com 2>/dev/null)"
+  code=$?
+  out="$(printf '%s' "$out" | tr -d '\r')"
+  if [ "$code" != "0" ] || [ "$out" != "not locked" ]; then
+    echo "unlock-login: exit $code, stdout: $out"
+    return 1
+  fi
+}
+
+# I35: set-idp-secret reads stdin. A value gives exit 0 and "stored". Empty stdin gives exit 2.
+# The stderr of the command goes to a file in the key folder. I29 looks for the test secret in it.
+test_identity_set_idp_secret() {
+  local out code
+  out="$(printf '%s\n' "$idp_test_secret" | dc exec -T identity /identity set-idp-secret google 2>"$key_dir/idp-stderr")"
+  code=$?
+  out="$(printf '%s' "$out" | tr -d '\r')"
+  if [ "$code" != "0" ] || [ "$out" != "stored" ]; then
+    echo "set-idp-secret with a value: exit $code, output: $out"
+    return 1
+  fi
+  out="$(printf '' | dc exec -T identity /identity set-idp-secret google 2>/dev/null)"
+  code=$?
+  if [ "$code" != "2" ]; then
+    echo "set-idp-secret with empty stdin: expected exit 2, got $code. Output: $out"
+    return 1
+  fi
+}
+
+# Wait until identity is healthy.
+identity_healthy() {
+  [ "$(dc ps --format '{{.Service}} {{.Health}}' | awk '$1 == "identity" { print $2 }')" = "healthy" ]
+}
+
+# I36: a test Google client ID in a second env file. The login page then has a link to Google and
+# no link to Microsoft. The secret of I35 is stored, so identity starts. Discovery is lazy, so no
+# real account is necessary. After the check, the stack uses the first env file again.
+# This check runs after I35 and after all other identity checks.
+test_identity_google_enabled() {
+  local result=0 out
+  sed -e "s|^CONSTELLATION_ENV_FILE=.*|CONSTELLATION_ENV_FILE=$extra_env_file|" "$env_file" > "$extra_env_file"
+  echo "IDENTITY_GOOGLE_CLIENT_ID=smoke-test-client.apps.googleusercontent.com" >> "$extra_env_file"
+  if docker compose -p "$project" --env-file "$extra_env_file" up -d --no-deps --force-recreate identity >/dev/null 2>&1 \
+    && poll 120 identity_healthy; then
+    out="$(identity_raw_get /login)"
+    if ! printf '%s' "$out" | grep -qF '/login/oidc/google'; then
+      echo "the login page has no link to /login/oidc/google"
+      result=1
+    fi
+    if printf '%s' "$out" | grep -qF '/login/oidc/microsoft'; then
+      echo "the login page has a link to /login/oidc/microsoft"
+      result=1
+    fi
+    out="$(identity_raw_get /login/oidc/microsoft)"
+    if [ "$(http_code "$out")" != "404" ]; then
+      echo "GET /login/oidc/microsoft did not give 404: $(printf '%s\n' "$out" | head -n 1)"
+      result=1
+    fi
+    # The log of the identity container that started with the provider on has no test secret.
+    if dc logs identity 2>&1 | grep -qF -- "$idp_test_secret"; then
+      echo "the log of identity with a Google client ID has the test client secret"
+      result=1
+    fi
+  else
+    echo "identity did not become healthy with a Google client ID"
+    dc logs --tail 20 identity
+    result=1
+  fi
+  rm -f "$extra_env_file"
+  if ! { dc up -d --no-deps --force-recreate identity >/dev/null 2>&1 && poll 120 identity_healthy; }; then
+    echo "identity did not become healthy after the restore of the first env file"
+    result=1
+  fi
+  return "$result"
 }
 
 make_master_key || { echo "FAIL: the master key of identity"; exit 1; }
@@ -613,8 +743,13 @@ run_check "I28b: identity Valkey user cannot read another prefix" \
   expect_output NOPERM vk identity "$(envval IDENTITY_VALKEY_PASSWORD)" GET smoke_a:k
 run_check "I28c: identity Valkey user can write its prefix" \
   expect_exact OK vk identity "$(envval IDENTITY_VALKEY_PASSWORD)" SET identity:smoke 1
+run_check "I32: identity login page has no upstream link with no provider" test_identity_login_no_provider
+run_check "I33: identity login page has the CSP script-src 'self'" test_identity_login_csp
+run_check "I34: identity unlock-login" test_identity_unlock_login
+run_check "I35: identity set-idp-secret" test_identity_set_idp_secret
 run_check "I29: no secret in the identity log" test_identity_no_secret_in_logs
 run_check "I31: identity rate limit of GET /setup" test_identity_setup_rate_limit
+run_check "I36: identity with a Google client ID" test_identity_google_enabled
 
 if [ "${#failures[@]}" -ne 0 ]; then
   echo "smoke-test: ${#failures[@]} check(s) failed: ${failures[*]}"
