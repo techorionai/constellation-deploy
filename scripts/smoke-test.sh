@@ -448,21 +448,30 @@ svc_get() {
   dc exec -T postgres wget -q -T 10 -O - "$1"
 }
 
-# I30: the URL-encoded database password decodes to the database password. The password has
-# characters that need encoding, so a wrong encoded value stops identity from connecting.
-test_identity_password_encoding() {
-  local plain encoded decoded
-  plain="$(envval IDENTITY_DB_PASSWORD)"
-  encoded="$(envval IDENTITY_DB_PASSWORD_URLENCODED)"
+# I30 (identity) and I48 (events): the URL-encoded database password decodes to the database
+# password. The password has characters that need encoding, so a wrong encoded value stops the
+# service from connecting. The argument is the prefix of the variable names.
+check_password_encoding() {
+  local prefix="$1" plain encoded decoded
+  plain="$(envval "${prefix}_DB_PASSWORD")"
+  encoded="$(envval "${prefix}_DB_PASSWORD_URLENCODED")"
   if [ "$plain" = "$encoded" ]; then
     echo "the test password does not need encoding"
     return 1
   fi
   decoded="$(printf '%b' "${encoded//%/\\x}")"
   if [ "$decoded" != "$plain" ]; then
-    echo "the encoded password does not decode to IDENTITY_DB_PASSWORD"
+    echo "the encoded password does not decode to ${prefix}_DB_PASSWORD"
     return 1
   fi
+}
+
+test_identity_password_encoding() {
+  check_password_encoding IDENTITY
+}
+
+test_events_password_encoding() {
+  check_password_encoding EVENTS
 }
 
 # I25: the JWKS has one public ES256 key and no private part.
@@ -706,10 +715,17 @@ test_events_ready() {
   svc_get http://events:9090/readyz >/dev/null
 }
 
-# I39: a wrong key ID in a second env file. The events service must not become ready, and its log
+# The number of log records of identity about a refused client authentication.
+identity_refusals() {
+  dc logs identity 2>&1 | grep -F 'token request failed' | grep -cF 'invalid_client'
+}
+
+# I39: a wrong key ID in a second env file. The events service must not become ready, identity must
+# refuse the key ID (a new "token request failed" record with invalid_client), and its log
 # has no private key. After the check, the stack uses the first env file again.
 test_events_wrong_key_id() {
-  local result=0 i key_body
+  local result=0 i key_body before after
+  before="$(identity_refusals)"
   sed -e "s|^CONSTELLATION_ENV_FILE=.*|CONSTELLATION_ENV_FILE=$extra_env_file|" \
     -e 's|^EVENTS_CLIENT_KEY_ID=.*|EVENTS_CLIENT_KEY_ID=events-wrong|' "$env_file" > "$extra_env_file"
   docker compose -p "$project" --env-file "$extra_env_file" up -d --no-deps --force-recreate events >/dev/null 2>&1 \
@@ -722,6 +738,11 @@ test_events_wrong_key_id() {
       break
     fi
   done
+  after="$(identity_refusals)"
+  if [ "$after" -le "$before" ]; then
+    echo "identity did not log a refused token request for the wrong key ID ($before before, $after after)"
+    result=1
+  fi
   key_body="$(sed -n 2p "$key_dir/events-client-key.pem")"
   if dc logs events 2>&1 | grep -qF -e 'PRIVATE KEY' -e "$key_body"; then
     echo "the events log has private key text"
@@ -779,7 +800,10 @@ test_stream_events_user() {
   pw="$(envval EVENTS_VALKEY_PASSWORD)"
   expect_output NOPERM vk events "$pw" XADD events.stream:smoke_a '*' k v || return 1
   expect_output NOPERM vk events "$pw" DEL events.stream:smoke_a || return 1
-  expect_output smoke_a vk events "$pw" XINFO GROUPS events.stream:smoke_b || return 1
+  # The check makes its own entry and its own group. It does not use the group of I41.
+  vk_admin XADD events.stream:smoke_b '*' k v >/dev/null || return 1
+  expect_exact OK vk events "$pw" XGROUP CREATE events.stream:smoke_b smoke_events_check 0 || return 1
+  expect_output smoke_events_check vk events "$pw" XINFO GROUPS events.stream:smoke_b || return 1
   out="$(vk events "$pw" XADD events.stream:events '*' k v 2>&1)"
   if ! printf '%s\n' "$out" | has_entry_id; then
     echo "XADD to the stream events gave: $out"
@@ -831,9 +855,17 @@ test_events_no_secret_in_logs() {
   fi
 }
 
+# True if the Docker host is Docker Desktop. It ignores create_host_path: false for a bind mount.
+docker_desktop_host() {
+  [ "$(docker info --format '{{.OperatingSystem}}' 2>/dev/null | tr -d '\r')" = "Docker Desktop" ]
+}
+
 # I47: identity does not start when the clients file is missing, and Docker makes no directory.
+# On a Linux host, Docker refuses the mount and names the host path, and the check needs this.
+# Docker Desktop makes the path and ignores create_host_path: false. There, identity must still
+# stop with an error that names the file of the container and says that it is a directory.
 test_identity_missing_clients_file() {
-  local missing out
+  local missing out container_path=/etc/identity/clients.yaml
   missing="${IDENTITY_CLIENTS_PATH%/*}/missing/identity-clients.yaml"
   if out="$(IDENTITY_CLIENTS_PATH="$missing" dc run --rm --no-deps -T identity 2>&1)"; then
     echo "identity started with a missing clients file"
@@ -845,13 +877,16 @@ test_identity_missing_clients_file() {
       echo "Docker made the path of the missing clients file"
       return 1
     fi
-  elif printf '%s' "$out" | grep -qF 'is a directory'; then
-    # Docker Desktop makes the path and ignores create_host_path: false. Identity still stops.
-    echo "note: this Docker host made the path as a directory. Identity stopped with an error."
+  elif docker_desktop_host; then
+    if ! { printf '%s' "$out" | grep -qF -- "$container_path" && printf '%s' "$out" | grep -qF 'is a directory'; }; then
+      echo "identity did not stop with an error that names $container_path as a directory"
+      printf '%s\n' "$out"
+      return 1
+    fi
+    echo "note: Docker Desktop made the path as a directory. Identity stopped with an error."
   else
     echo "the output does not name the path $missing"
-    printf '%s
-' "$out"
+    printf '%s\n' "$out"
     return 1
   fi
 }
@@ -906,6 +941,7 @@ run_check "I14: Grafana without credentials" test_grafana_anonymous
 run_check "I15: no password in provisioning logs" test_no_password_in_logs
 
 run_check "I30: identity database password encoding" test_identity_password_encoding
+run_check "I48: events database password encoding" test_events_password_encoding
 run_check "I25: identity JWKS" test_identity_jwks
 run_check "I26: identity discovery document" test_identity_discovery
 run_check "I27: identity setup link record" test_identity_setup_log

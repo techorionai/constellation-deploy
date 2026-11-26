@@ -186,4 +186,44 @@ else
   fail "U11: bad key ID" "the script accepted the key ID or made a file"
 fi
 
+# U13: an existing folder with group or other permissions is refused. A 0700 folder is accepted.
+d="$(fresh)"
+mkdir "$d/s"
+chmod 0755 "$d/s"
+if [ "$(mode_of "$d/s")" = "755" ] && [ "$(umask 077; mode_of "$d/s")" = "755" ]; then
+  if ! out="$(run "$d" --secrets-dir s helpdesk)" && printf '%s' "$out" | grep -qF 'chmod 0700' \
+    && [ ! -e "$d/s/helpdesk-client-key.pem" ] && [ ! -e "$d/s/identity-clients.yaml" ]; then
+    pass "U13: folder with the mode 0755 is refused"
+  else
+    fail "U13: folder with the mode 0755 is refused" "$out"
+  fi
+  chmod 0700 "$d/s"
+  if run "$d" --secrets-dir s helpdesk >/dev/null && [ -f "$d/s/helpdesk-client-key.pem" ]; then
+    pass "U13: folder with the mode 0700 is accepted"
+  else
+    fail "U13: folder with the mode 0700 is accepted" "the script refused a 0700 folder"
+  fi
+else
+  echo "skip: U13: this host does not keep the mode of a folder"
+fi
+
+# U14: if the clients file cannot be put in place, no key file stays. A fake mv fails for it.
+d="$(fresh)"
+mkdir "$d/bin"
+real_mv="$(command -v mv)"
+cat > "$d/bin/mv" <<MV
+#!/usr/bin/env bash
+case "\${!#}" in
+  *identity-clients.yaml) exit 1 ;;
+esac
+exec "$real_mv" "\$@"
+MV
+chmod +x "$d/bin/mv"
+if ! out="$(PATH="$d/bin:$PATH" run "$d" --secrets-dir s helpdesk)" && [ ! -e "$d/s/helpdesk-client-key.pem" ] \
+  && [ ! -e "$d/s/identity-clients.yaml" ]; then
+  pass "U14: no key file stays when the clients file fails"
+else
+  fail "U14: no key file stays when the clients file fails" "$out"
+fi
+
 exit "$failed"

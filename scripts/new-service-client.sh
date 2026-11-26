@@ -112,6 +112,12 @@ fi
 
 umask 077
 mkdir -p "$secrets_dir"
+# The key file can get the mode 0444 on Docker Desktop. That is safe only if the folder has no
+# permission for group and other. A new folder has the mode 0700, but an old folder can differ.
+dir_mode="$(stat -c %a "$secrets_dir" 2>/dev/null || stat -f %Lp "$secrets_dir" 2>/dev/null)" \
+  || die "could not read the mode of the folder $secrets_dir"
+[ "${dir_mode: -2}" = "00" ] \
+  || die "the folder $secrets_dir has the mode $dir_mode. It must have the mode 0700: run chmod 0700 $secrets_dir"
 tmp_key="$(mktemp "$secrets_dir/.new-key.XXXXXX")"
 tmp_clients=""
 cleanup() {
@@ -188,12 +194,19 @@ if [ "$rotate" -eq 0 ]; then
       ;;
   esac
   chmod 0644 "$tmp_clients"
-  mv "$tmp_clients" "$clients_file"
-  tmp_clients=""
 fi
 
+# Put the key file in place first. Then put the clients file in place. If the second step fails,
+# remove the new key file, so the clients file never has an entry with no key file.
 chmod 0400 "$tmp_key"
 mv "$tmp_key" "$key_file"
+if [ -n "$tmp_clients" ]; then
+  if ! mv "$tmp_clients" "$clients_file"; then
+    rm -f "$key_file"
+    die "could not write the clients file $clients_file. The new key file was removed."
+  fi
+  tmp_clients=""
+fi
 
 echo "Key file: $key_file"
 echo "Key ID: $kid"
