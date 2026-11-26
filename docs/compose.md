@@ -78,7 +78,7 @@ Limit: Loki, Tempo, Prometheus, and the collector have no authentication. A plat
 
 ## Identity
 
-The service `identity` is the identity provider of the platform. It uses the image `ghcr.io/techorionai/constellation-identity:0.3.0`. It uses the database `identity` and the Valkey user `identity` that the provisioning services make from the name `identity` in `CONSTELLATION_SERVICES`.
+The service `identity` is the identity provider of the platform. It uses the image `ghcr.io/techorionai/constellation-identity:0.4.0`. It uses the database `identity` and the Valkey user `identity` that the provisioning services make from the name `identity` in `CONSTELLATION_SERVICES`.
 
 ### Master key
 
@@ -111,6 +111,8 @@ The command `install -d -m 0700` does not change the mode of a folder that exist
 - Identity limits the requests to its public endpoints with counters in Valkey. Valkey must be healthy. Most limits fail closed with status 503 when Valkey is down. The defaults need no setting. `IDENTITY_RATE_LIMIT__ENABLED` and `IDENTITY_RATE_LIMIT__<BUCKET>__LIMIT` are optional.
 - The limits use the client IP. Behind a proxy without `IDENTITY_TRUSTED_PROXIES`, all clients share the limits of the proxy address. Each trusted proxy must append the address of its peer to `X-Forwarded-For`.
 - To remove the login lock of one email, run `docker compose exec identity /identity unlock-login <email>`.
+- An admin with no MFA must set up TOTP at the next login. `IDENTITY_MFA__REQUIRE_FOR_ADMINS` controls this rule. Its default is `true`. The service seals the TOTP secrets with the master key of identity.
+- To remove the TOTP factor of a user who lost the device and the recovery codes, run `docker compose exec identity /identity reset-mfa <email>`.
 - `config/identity/clients.yaml` is the clients file. It has `clients: []`. When a service needs a client, add it to this file and restart `identity`.
 - The `AllowInsecureHTTP` options of the services that call identity are for local Compose only (see "Add a service"). Production uses `https` and keeps the options `false`.
 
