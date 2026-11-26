@@ -74,12 +74,19 @@ expect_ok() {
 # The ACL rule has the SHA-256 hash of the password, not the password. The rule is the
 # ACL of the platform: own key prefix only, no admin or dangerous commands, no scripts,
 # and no command that Valkey does not filter by key pattern (SCAN, RANDOMKEY, DBSIZE, MEMORY).
+#
+# Each user also gets two selectors for the event streams. They are the same as
+# streams/valkey.ACLSelectors of platform-go. The stream prefix "events.stream:" has a ".".
+# A service name cannot have a ".", so no root pattern "~<svc>:*" matches a stream key.
+# The first selector lets the service write and trim only its own stream. The second selector
+# lets the service read, ack, and claim on every stream. The ACL cannot isolate consumer groups.
+# Each selector is in quotes, because valkey-cli splits the rule at spaces.
 provision() {
   svc="$1"
   upper=$(printf '%s' "$svc" | tr '[:lower:]' '[:upper:]')
   pw=$(printenv "${upper}_VALKEY_PASSWORD" || true)
   hash=$(printf '%s' "$pw" | sha256sum | cut -d' ' -f1)
-  reply=$(cli "ACL SETUSER $svc reset on #$hash ~$svc:* +@all -@admin -@dangerous -@scripting -function -scan -randomkey -dbsize -memory")
+  reply=$(cli "ACL SETUSER $svc reset on #$hash ~$svc:* +@all -@admin -@dangerous -@scripting -function -scan -randomkey -dbsize -memory \"(~events.stream:$svc +xadd +xtrim)\" \"(~events.stream:* +xreadgroup +xack +xautoclaim +xpending +xinfo|groups +xinfo|stream +xinfo|consumers +xgroup|create +xgroup|createconsumer +xgroup|delconsumer +xrange)\"")
   expect_ok "$reply"
   echo "valkey: provisioned $svc"
 }

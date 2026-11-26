@@ -5,7 +5,7 @@
 ## Requirements
 
 - Docker Engine with Docker Compose 2.38 or later.
-- `openssl` to make passwords and the master key of identity.
+- `openssl` to make passwords, the master key of identity, and the client keys of services.
 
 ## Install
 
@@ -22,9 +22,17 @@
 
    Then set the owner and the mode of the file (see "Master key").
 
-5. Start the base: `docker compose up -d`.
-6. Examine the states: `docker compose ps`. The services `postgres`, `valkey`, `prometheus`, `grafana`, and `identity` show `healthy`. The collector, Loki, and Tempo show `running`, because their images have no shell for a health check. The services `provision-postgres` and `provision-valkey` show `exited (0)`.
-7. Open Grafana at `http://127.0.0.1:3000`. Log in with `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD`.
+5. Make the client key of the events service and the clients file of identity (see "Service clients"). Run this step before `docker compose up -d`. Without the clients file, identity does not start, and Docker makes no directory at the missing path.
+
+   ```sh
+   bash scripts/new-service-client.sh events
+   ```
+
+   Then set the owner of the key as the script prints (`sudo chown 65532:65532 secrets/events-client-key.pem`). On Docker Desktop, use the fallback in "Service clients".
+
+6. Start the base: `docker compose up -d`.
+7. Examine the states: `docker compose ps`. The services `postgres`, `valkey`, `prometheus`, `grafana`, `identity`, and `events` show `healthy`. The collector, Loki, and Tempo show `running`, because their images have no shell for a health check. The services `provision-postgres` and `provision-valkey` show `exited (0)`.
+8. Open Grafana at `http://127.0.0.1:3000`. Log in with `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD`.
 
 Use `docker compose up -d` and not `docker compose up -d --wait` for the base. Compose 5 returns an error for `--wait` when a one-shot service exits and no other service depends on it. A service block that depends on both provisioning services (see "Add a service") works with `--wait`.
 
@@ -47,6 +55,10 @@ All settings are in `.env`. Compose reads `.env` in the project folder. The vari
 | `IDENTITY_ISSUER` | none | Public URL of identity, as browsers use it. It must agree with `IDENTITY_BIND` and `IDENTITY_PORT`. |
 | `IDENTITY_MASTER_KEY_FILE` | none | Path of the master key file on the host. |
 | `IDENTITY_MASTER_KEY_ID` | none | ID of the master key. It is not a secret. |
+| `IDENTITY_CLIENTS_PATH` | `./secrets/identity-clients.yaml` | Path of the identity clients file on the host (see "Service clients"). |
+| `EVENTS_DB_PASSWORD`, `EVENTS_DB_PASSWORD_URLENCODED`, `EVENTS_VALKEY_PASSWORD` | none | Database and Valkey passwords of the events service. The second value is the URL-encoded form of the first. |
+| `EVENTS_CLIENT_KEY_FILE` | none | Path of the client key file of the events service on the host. |
+| `EVENTS_CLIENT_KEY_ID` | none | ID of the client key. It is not a secret. |
 | `IDENTITY_BIND`, `IDENTITY_PORT` | `127.0.0.1`, `8080` | Host IP and host port of identity. Keep the bind on loopback unless a TLS reverse proxy runs on the same host. |
 | `IDENTITY_TRUSTED_PROXIES` | empty | CIDR list of the reverse proxies in front of identity. Set it when you use a proxy (see "Identity"). |
 | `IDENTITY_GOOGLE_CLIENT_ID` | empty (off) | Client ID of the Google OAuth client. Setting it turns on the login with Google. Store the client secret first (see "Upstream login"). |
@@ -74,7 +86,7 @@ Do not publish other ports. This includes the OTLP ports of the collector (4317 
 
 The base has two networks.
 
-- `services` has `postgres`, `valkey`, the two provisioning services, `otel-collector`, `identity`, and each later platform service.
+- `services` has `postgres`, `valkey`, the two provisioning services, `otel-collector`, `identity`, `events`, and each later platform service.
 - `observability` has `otel-collector`, `prometheus`, `loki`, `tempo`, and `grafana`.
 
 Only the collector is on both networks. A platform service cannot reach Loki, Tempo, or Prometheus, so it cannot read the telemetry of other services. The observability containers cannot reach PostgreSQL or Valkey.
@@ -83,7 +95,7 @@ Limit: Loki, Tempo, Prometheus, and the collector have no authentication. A plat
 
 ## Identity
 
-The service `identity` is the identity provider of the platform. It uses the image `ghcr.io/techorionai/constellation-identity:0.6.0`. It uses the database `identity` and the Valkey user `identity` that the provisioning services make from the name `identity` in `CONSTELLATION_SERVICES`.
+The service `identity` is the identity provider of the platform. It uses the image `ghcr.io/techorionai/constellation-identity:0.7.1`. It uses the database `identity` and the Valkey user `identity` that the provisioning services make from the name `identity` in `CONSTELLATION_SERVICES`.
 
 ### Master key
 
@@ -119,7 +131,7 @@ The command `install -d -m 0700` does not change the mode of a folder that exist
 - An admin with no MFA must set up TOTP or register a passkey at the next login. This rule is on by default. The Compose file does not pass `IDENTITY_MFA__REQUIRE_FOR_ADMINS` to the container, so you cannot change the rule in `.env`. The service seals the TOTP secrets with the master key of identity. After the upgrade, each admin must set up TOTP or register a passkey at once. Until then, a person who knows the password of the admin can set up the second factor.
 - To remove the TOTP factor, the recovery codes, and all passkeys of a user who lost the device and the recovery codes, or a user with passkeys only (such a user has no recovery codes), run `docker compose exec identity /identity reset-mfa <email>`. Before you run it, check the identity of the requester outside the service, for example in person or by a call. After the reset, the password alone gives a login and a new second factor. The user must set up TOTP or register a passkey at once.
 - Users can register passkeys on the page `/account/passkeys`. The RP ID of a passkey is the host of `IDENTITY_ISSUER`. For a local use, set `IDENTITY_ISSUER` to `http://localhost:8080`, not `http://127.0.0.1:8080`. An issuer with an IP address as host turns passkeys off. Then the hosted passkey pages give 404, and a stored passkey does not count as a second factor. A change of the issuer host makes all stored passkeys useless. Warning: do not change the issuer host to an IP address after users registered passkeys. A user with passkeys only can then log in with the password alone. An admin with passkeys only can then set up TOTP after a login with the password alone. Before you change the issuer host, tell the users to register TOTP or a second passkey. See also "Lock-out warning". The setting `IDENTITY_WEBAUTHN__ENABLED` (default `true`) turns passkeys off. The Compose file does not pass it to the container, so you cannot change it in `.env`.
-- `config/identity/clients.yaml` is the clients file. It has `clients: []`. When a service needs a client, add it to this file and restart `identity`.
+- `secrets/identity-clients.yaml` is the clients file. The script `scripts/new-service-client.sh` writes it (see "Service clients"). Identity reads it only at the start, so restart `identity` after each change.
 - The `AllowInsecureHTTP` options of the services that call identity are for local Compose only (see "Add a service"). Production uses `https` and keeps the options `false`.
 
 ### Upstream login
@@ -197,6 +209,58 @@ docker compose exec identity /identity setup-link
 
 The command prints the link and deletes the earlier unused links. Run it again to get a new link. If an admin exists, it prints an error. Do not put the link in a log, a ticket, or a chat.
 
+## Events service
+
+The service `events` is the events service of the platform. It uses the image `ghcr.io/techorionai/constellation-events:0.1.0`, the database `events`, and the Valkey user `events`. It has no published port. Only services on the network `services` call it. Its admin port `9090` is not published.
+
+- The events service is the first service client in Compose. It gets tokens from identity with a client key (see "Service clients"). It reads the private key as the Compose secret `events_client_key` from the file `EVENTS_CLIENT_KEY_FILE`.
+- It starts after identity is healthy. It is ready only after it publishes its manifest to identity with a client credentials token. If `readyz` does not give 200, examine `EVENTS_CLIENT_KEY_ID` and the clients file first.
+- The events service has no role. The implicit role `identity:service` lets it publish its manifest.
+- Compose sets the three `ALLOW_INSECURE_HTTP` options of the service to `true`, because the internal network has no TLS. The audience `events` is set in the code of the service.
+- The Grafana alert rule for the consumer lag and the dashboards are out of scope. The service sends the lag metric.
+
+## Event stream ACL
+
+`provision-valkey` gives each Valkey user two selectors for the event streams. The text is the same as `streams/valkey.ACLSelectors` of `constellation-platform-go`.
+
+- `(~events.stream:<svc> +xadd +xtrim)` lets a service write and trim only its own stream.
+- `(~events.stream:* +xreadgroup +xack +xautoclaim +xpending +xinfo|groups +xinfo|stream +xinfo|consumers +xgroup|create +xgroup|createconsumer +xgroup|delconsumer +xrange)` lets a service read events, acknowledge them, and manage its consumers on each stream.
+
+All service users get the selectors, also `identity` and `events`. A service writes events only through its own outbox, so its own stream is the only write target.
+
+The stream key prefix is `events.stream:`. It has a dot. A service name cannot have a dot, so the pattern `<svc>:*` of the root rule never matches a stream key.
+
+Limit: the ACL cannot isolate consumer groups. A service can acknowledge or claim the messages of the group of another service on any stream. It can delete a consumer of another group, and the pending entries of that consumer go away. It can make a group, or an empty stream with `MKSTREAM`. It cannot write or trim the stream of another app, and it cannot delete a stream.
+
+An existing install gets the selectors after `docker compose run --rm provision-valkey`.
+
+## Service clients
+
+A platform service that gets tokens from identity needs a client entry in the clients file of identity and a private key. The script `scripts/new-service-client.sh` makes both.
+
+```sh
+bash scripts/new-service-client.sh [--secrets-dir DIR] [--clients-file FILE] [--kid KID] [--rotate] <svc> [role ...]
+```
+
+- `<svc>` is the name of the service. The script refuses the name `identity` and each name that `provision/valkey.sh` refuses.
+- A role has the form `<app>:<role>`, for example `events:producer`.
+- The script makes an EC P-256 private key (PKCS #8 PEM) as `<secrets dir>/<svc>-client-key.pem` with the mode `0400`. It does not overwrite a key file. The default key ID is `<svc>-1`. `--kid` sets another ID.
+- The script computes the public JWK and adds the client entry to the clients file. The default clients file is `./secrets/identity-clients.yaml`. `--clients-file` sets another path. The script does not read `.env`. If `IDENTITY_CLIENTS_PATH` has another value, give the same path with `--clients-file`.
+- The clients file can be in one of three forms: no file, a file with the line `clients: []`, or a file with the line `clients:` and block list entries that start with `  - id: `. The script refuses each other form, for example a flow list, and changes nothing. It refuses a client `id` that exists. The script writes a temporary file in the same folder and renames it, so the change is atomic. The mode of the clients file is `0644`. The file has public keys only.
+- Run the script before `docker compose up -d`. Compose mounts the clients file with `create_host_path: false`. If the file does not exist, Docker refuses the mount and makes no directory. Docker Desktop on Windows can make a directory at the missing path and ignore this option. Identity then stops with the error "is a directory". Remove the directory and run the script.
+- The script prints the next steps. They are the key owner, the two variables of the service in `.env` (`<SVC>_CLIENT_KEY_FILE` and `<SVC>_CLIENT_KEY_ID`), and a restart of identity.
+
+Key owner and mode: the container user has the UID 65532. A Compose file secret keeps the owner and the mode of the host file. On Linux, run `sudo chown 65532:65532 secrets/<svc>-client-key.pem`. The script does not use `sudo`. On Docker Desktop, where you cannot change the owner, use `chmod 0444` on the key file. Keep the mode `0700` on the folder `secrets/`. That mode is then the only control. The script stops if the folder has a permission for group or other.
+
+Rotation of a key:
+
+1. Run `bash scripts/new-service-client.sh --rotate --kid <svc>-2 <svc>`. The script makes the key file `<svc>-client-key-<svc>-2.pem` and prints a `keys` entry. It does not change the clients file.
+2. Add the printed entry to the `keys` of the client in the clients file. Restart identity.
+3. Set the new key file and the new key ID in `.env`. Restart the service.
+4. Delete the old key entry from the clients file. Restart identity.
+
+Backup: keep a copy of the folder `secrets/`. It has the master key of identity, the client keys, and the clients file.
+
 ## Provisioning
 
 `CONSTELLATION_SERVICES` has the service names, for example `identity,audit`. A name matches `^[a-z][a-z0-9_]{0,31}$`. The names `default`, `public`, `postgres`, `template0`, `template1`, and each name that starts with `pg_` are reserved. For each name `<svc>`, `.env` has `<SVC>_DB_PASSWORD` and `<SVC>_VALKEY_PASSWORD` (upper case).
@@ -204,7 +268,7 @@ The command prints the link and deletes the earlier unused links. Run it again t
 Two one-shot services make the objects. They are idempotent. A second run gives the same result.
 
 - `provision-postgres` makes the role `<svc>` and the database `<svc>` with the role as owner. It removes the `CONNECT` permission of `PUBLIC` and gives it to the role. A service cannot connect to the database of another service. The script also removes `CONNECT` and `TEMP` of `PUBLIC` on the databases `postgres` and `template1`, and it sets `CONNECTION LIMIT` of each role to `SERVICE_DB_CONNECTION_LIMIT`.
-- `provision-valkey` makes the ACL user `<svc>`. The user can use the keys `<svc>:*` and the commands `+@all -@admin -@dangerous -@scripting -function -scan -randomkey -dbsize -memory`. Valkey does not filter `SCAN`, `RANDOMKEY`, `DBSIZE`, and `MEMORY` by key pattern, so they would show the key names of other services. A script (`EVAL`) can block Valkey for all services, so scripts are off. The script saves the users to the ACL file in the `valkey-data` volume, so they stay after a restart. The ACL file has the SHA-256 hash of each password, not the password.
+- `provision-valkey` makes the ACL user `<svc>`. The user can use the keys `<svc>:*` and the commands `+@all -@admin -@dangerous -@scripting -function -scan -randomkey -dbsize -memory`. Valkey does not filter `SCAN`, `RANDOMKEY`, `DBSIZE`, and `MEMORY` by key pattern, so they would show the key names of other services. A script (`EVAL`) can block Valkey for all services, so scripts are off. Each user also has two selectors for the event streams (see "Event stream ACL"). The script saves the users to the ACL file in the `valkey-data` volume, so they stay after a restart. The ACL file has the SHA-256 hash of each password, not the password.
 
 The scripts do not print passwords, and they do not put passwords on a command line. The scripts reject the placeholder `change-me`, a password with fewer than 12 characters, and a Valkey password with white space, before they change anything. Services connect to PostgreSQL directly. Do not put a pooler in transaction mode between them, because it breaks the advisory locks of the migrations.
 
@@ -212,8 +276,9 @@ The scripts do not print passwords, and they do not put passwords on a command l
 
 1. Add the name to `CONSTELLATION_SERVICES` in `.env`.
 2. Add `<SVC>_DB_PASSWORD` and `<SVC>_VALKEY_PASSWORD` to `.env`.
-3. Add a service block to `compose.yaml` (the template below).
-4. Run the provisioning services: `docker compose run --rm provision-postgres` and `docker compose run --rm provision-valkey`. Then run `docker compose up -d`. Use `docker compose run --rm` because `docker compose up -d` does not start an exited one-shot container again when its configuration did not change.
+3. If the service gets tokens from identity, run `bash scripts/new-service-client.sh <svc> [role ...]` and follow the steps that it prints (see "Service clients").
+4. Add a service block to `compose.yaml` (the template below). The `events` block is an example of a service client.
+5. Run the provisioning services: `docker compose run --rm provision-postgres` and `docker compose run --rm provision-valkey`. Then run `docker compose up -d`. Use `docker compose run --rm` because `docker compose up -d` does not start an exited one-shot container again when its configuration did not change.
 
 Template for a service `identity`. Use the exact version tag of the image in place of `<version>` (for example `0.1.0`). Replace `identity` and `IDENTITY` with the name of the service. URL-encode the password in `DATABASE__URL`. A platform service joins the `services` network only. Add the same hardening as the base services.
 
@@ -269,7 +334,7 @@ Values for a service that calls identity. Add the lines that the service needs t
       <SVC>_CLIENT__PRIVATE_KEY_FILE: /run/secrets/<svc>_client_key
 ```
 
-Give the private key of the client as a Compose secret. Never put the key in `.env` or in an `environment` value, because `docker inspect` shows it. Add this to the service block and to the top level of `compose.yaml`. Keep the key file in the folder `secrets/` with the owner of the service and the mode `0400`:
+Give the private key of the client as a Compose secret. Never put the key in `.env` or in an `environment` value, because `docker inspect` shows it. Add this to the service block and to the top level of `compose.yaml`. Keep the key file in the folder `secrets/` with the owner `65532:65532` and the mode `0400` (see "Service clients"):
 
 ```yaml
     # In the service block:
@@ -302,7 +367,7 @@ PostgreSQL, Valkey, and Grafana read the admin password at the first start of an
 - Valkey: `docker compose exec -e REDISCLI_AUTH=<old> valkey valkey-cli ACL SETUSER default '><new>'`. Then run `ACL SAVE` the same way. Then remove the old password with `ACL SETUSER default '<old'`, where `old` is the old password.
 - Grafana: `docker compose exec grafana grafana cli admin reset-admin-password <new>`.
 
-To change the password of a service, change the two values in `.env` and run both provisioning services again (see "Add a service", step 4). Then restart the service.
+To change the password of a service, change the two values in `.env` and run both provisioning services again (see "Add a service", step 5). Then restart the service.
 
 ## Telemetry
 
@@ -315,10 +380,11 @@ Run the tests from the repository root. They need Docker.
 ```sh
 bash scripts/check-compose.sh        # Static checks. No container runs.
 bash tests/check-compose-cases.sh    # Negative cases of the static checks.
+bash tests/new-service-client-cases.sh  # Tests of scripts/new-service-client.sh. Needs openssl, no Docker.
 bash scripts/smoke-test.sh           # Live containers. Takes some minutes.
 ```
 
-Check 5 of `scripts/check-compose.sh` requires the value `change-me` for each variable in `.env.example` that has `PASSWORD`, `SECRET`, `TOKEN`, or `KEY` in its name. Only the two exact names `IDENTITY_MASTER_KEY_FILE` and `IDENTITY_MASTER_KEY_ID` can have any value. A name with the suffix `_FILE` or `_ID` is not exempt.
+Check 5 of `scripts/check-compose.sh` requires the value `change-me` for each variable in `.env.example` that has `PASSWORD`, `SECRET`, `TOKEN`, or `KEY` in its name. Only the four exact names `IDENTITY_MASTER_KEY_FILE`, `IDENTITY_MASTER_KEY_ID`, `EVENTS_CLIENT_KEY_FILE`, and `EVENTS_CLIENT_KEY_ID` can have any value. A name with the suffix `_FILE` or `_ID` is not exempt.
 
 Run `scripts/smoke-test.sh` directly on the host, not under `act`. A relative bind mount does not work under `act` with a Docker Desktop host. The script uses the project name `constellation-smoke` and the values of `tests/smoke.env`. The values in this file are for tests only. The script removes its containers and volumes at the end.
 
@@ -337,3 +403,17 @@ This test shows that `.gitattributes` keeps LF line endings in the shell files w
 Change an image tag in a release of this repository. Read the release notes of the image before you change a tag. Then run `docker compose pull` and `docker compose up -d`. Each release of this repository examines the tags.
 
 Upgrade from identity `0.5.0` to `0.6.0`: the new version adds the database migrations `0014` and `0015`. The migrations only add objects. Read the release notes of identity `v0.6.0` and make a backup of the database before you update. The new settings of the upstream login are optional. With no client ID, identity has no upstream login.
+
+## Upgrade from v0.2.0 to v0.3.0
+
+The release `v0.3.0` adds the events service and the event stream ACL. It moves the clients file of identity. Do these steps in this order:
+
+1. Make a backup of the databases and of the folder `secrets/`.
+2. Before you get the new files, copy the old clients file: `install -m 0644 config/identity/clients.yaml secrets/identity-clients.yaml`.
+3. Get the files of the release `v0.3.0`.
+4. In `.env`, add `events` to `CONSTELLATION_SERVICES`. Add `EVENTS_DB_PASSWORD`, `EVENTS_DB_PASSWORD_URLENCODED`, `EVENTS_VALKEY_PASSWORD`, `EVENTS_CLIENT_KEY_FILE`, and `EVENTS_CLIENT_KEY_ID`. Until these values exist, each Compose command stops with an error that names the variable.
+5. Run `bash scripts/new-service-client.sh events`. Set the owner of the key as the script says.
+6. Run `docker compose pull`, `docker compose run --rm provision-postgres`, `docker compose run --rm provision-valkey`, then `docker compose up -d`.
+7. Examine the states with `docker compose ps`.
+
+Identity `0.6.0` to `0.7.1`: client credentials tokens get the `app` claim. Read the release notes of identity `v0.7.0` and `v0.7.1` before the update.

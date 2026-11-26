@@ -211,7 +211,7 @@ services:
 
   identity:
     <<: *hardened
-    image: ghcr.io/techorionai/constellation-identity:0.6.0
+    image: ghcr.io/techorionai/constellation-identity:0.7.1
     restart: unless-stopped
     read_only: true
     depends_on:
@@ -246,12 +246,67 @@ services:
     secrets:
       - identity_master_key
     volumes:
-      - ./config/identity/clients.yaml:/etc/identity/clients.yaml:ro
+      # The long syntax does not make a directory at a missing host path (see docs/compose.md).
+      - type: bind
+        source: ${IDENTITY_CLIENTS_PATH:-./secrets/identity-clients.yaml}
+        target: /etc/identity/clients.yaml
+        read_only: true
+        bind:
+          create_host_path: false
     # Only the public port. The admin port 9090 stays unpublished.
     ports:
       - "${IDENTITY_BIND:-127.0.0.1}:${IDENTITY_PORT:-8080}:8080"
     healthcheck:
       test: ["CMD", "/identity", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 30s
+    networks:
+      - services
+
+  events:
+    <<: *hardened
+    image: ghcr.io/techorionai/constellation-events:0.1.0
+    restart: unless-stopped
+    read_only: true
+    depends_on:
+      provision-postgres:
+        condition: service_completed_successfully
+      provision-valkey:
+        condition: service_completed_successfully
+      otel-collector:
+        condition: service_started
+      identity:
+        condition: service_healthy
+    environment:
+      EVENTS_DATABASE__URL: postgres://events:${EVENTS_DB_PASSWORD_URLENCODED:?Set EVENTS_DB_PASSWORD_URLENCODED}@postgres:5432/events?sslmode=disable
+      EVENTS_DATABASE__NAME: events
+      EVENTS_VALKEY__ADDRESS: valkey:6379
+      EVENTS_VALKEY__USERNAME: events
+      EVENTS_VALKEY__PASSWORD: ${EVENTS_VALKEY_PASSWORD:?Set EVENTS_VALKEY_PASSWORD in the env file}
+      EVENTS_VALKEY__KEY_PREFIX: events
+      # The service client of the events service. The private key is the Compose secret
+      # events_client_key. The key ID and the key path are not secrets.
+      EVENTS_CLIENT__ID: events
+      EVENTS_CLIENT__KEY_ID: ${EVENTS_CLIENT_KEY_ID:?Set EVENTS_CLIENT_KEY_ID in the env file}
+      EVENTS_CLIENT__PRIVATE_KEY_FILE: /run/secrets/events_client_key
+      EVENTS_CLIENT__ISSUER: ${IDENTITY_ISSUER:?Set IDENTITY_ISSUER in the env file}
+      EVENTS_CLIENT__TOKEN_URL: http://identity:8080/oauth/token
+      # The services talk to identity on the internal network with HTTP.
+      EVENTS_CLIENT__ALLOW_INSECURE_HTTP: "true"
+      EVENTS_IDENTITY__URL: http://identity:8080
+      EVENTS_IDENTITY__ALLOW_INSECURE_HTTP: "true"
+      EVENTS_AUTH__ISSUER: ${IDENTITY_ISSUER:?Set IDENTITY_ISSUER in the env file}
+      EVENTS_AUTH__JWKS_URL: http://identity:8080/.well-known/jwks.json
+      EVENTS_AUTH__ALLOW_INSECURE_HTTP: "true"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    secrets:
+      - events_client_key
+    # No published port. Only services on the network "services" call the events service.
+    # The admin port 9090 stays unpublished.
+    healthcheck:
+      test: ["CMD", "/events", "healthcheck"]
       interval: 10s
       timeout: 3s
       retries: 6
@@ -265,10 +320,13 @@ networks:
   services:
   observability:
 
-# The master key file of identity. The file keeps its owner and mode (see docs/compose.md).
+# The master key file of identity and the client key of the events service. A file keeps its
+# owner and mode (see docs/compose.md).
 secrets:
   identity_master_key:
     file: ${IDENTITY_MASTER_KEY_FILE:?Set IDENTITY_MASTER_KEY_FILE in the env file}
+  events_client_key:
+    file: ${EVENTS_CLIENT_KEY_FILE:?Set EVENTS_CLIENT_KEY_FILE in the env file}
 
 volumes:
   postgres-data:

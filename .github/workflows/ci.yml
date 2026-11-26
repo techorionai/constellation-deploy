@@ -9,5 +9,5 @@ jobs:
   compose:
     uses: techorionai/constellation-ci/.github/workflows/compose.yml@v0.2.0
     with:
-      unit-command: bash scripts/check-compose.sh && bash tests/check-compose-cases.sh
+      unit-command: bash scripts/check-compose.sh && bash tests/check-compose-cases.sh && bash tests/new-service-client-cases.sh
       integration-command: bash scripts/smoke-test.sh
