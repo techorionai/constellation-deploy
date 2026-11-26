@@ -196,7 +196,7 @@ test_up() {
 check_states() {
   local states service state health code
   states="$(dc ps -a --format '{{.Service}} {{.State}} {{.Health}} {{.ExitCode}}')"
-  for service in postgres valkey prometheus grafana identity; do
+  for service in postgres valkey prometheus grafana identity events; do
     health="$(printf '%s\n' "$states" | awk -v s="$service" '$1 == s { print $3 }')"
     if [ "$health" != "healthy" ]; then
       echo "$service is not healthy: $health"
@@ -420,21 +420,27 @@ test_no_password_in_logs() {
   done < <(grep -E '^[A-Za-z0-9_]*_PASSWORD=' "$env_file")
 }
 
-# Make the master key of identity in a temporary folder with the procedure of docs/compose.md.
-# The folder has mode 0700 and the file has mode 0444, so the container user can read it.
-# The script exports the path. A shell variable overrides the env file.
-make_master_key() {
+# Make the keys in a temporary folder with the procedures of docs/compose.md: the master key of
+# identity, and the client key and the clients file of the events service (scripts/new-service-client.sh).
+# The folder has mode 0700 and each key file has mode 0444, so the container user can read it.
+# The script exports the paths. A shell variable overrides the env file.
+make_keys() {
   key_dir="$(mktemp -d)" || return 1
   chmod 0700 "$key_dir"
   openssl rand -base64 32 > "$key_dir/identity-master-key" || return 1
   chmod 0444 "$key_dir/identity-master-key"
+  bash scripts/new-service-client.sh --secrets-dir "$key_dir" --clients-file "$key_dir/identity-clients.yaml" \
+    events >/dev/null || return 1
+  chmod 0444 "$key_dir/events-client-key.pem"
   # Docker on Windows needs a Windows path. Git Bash gives one with cygpath.
+  local host_dir="$key_dir"
   if command -v cygpath >/dev/null 2>&1; then
-    IDENTITY_MASTER_KEY_FILE="$(cygpath -m "$key_dir")/identity-master-key"
-  else
-    IDENTITY_MASTER_KEY_FILE="$key_dir/identity-master-key"
+    host_dir="$(cygpath -m "$key_dir")"
   fi
-  export IDENTITY_MASTER_KEY_FILE
+  IDENTITY_MASTER_KEY_FILE="$host_dir/identity-master-key"
+  EVENTS_CLIENT_KEY_FILE="$host_dir/events-client-key.pem"
+  IDENTITY_CLIENTS_PATH="$host_dir/identity-clients.yaml"
+  export IDENTITY_MASTER_KEY_FILE EVENTS_CLIENT_KEY_FILE IDENTITY_CLIENTS_PATH
 }
 
 # Read a URL from the container postgres. It is in the network "services", like a business service.
@@ -684,7 +690,173 @@ test_identity_google_enabled() {
   return "$result"
 }
 
-make_master_key || { echo "FAIL: the master key of identity"; exit 1; }
+# Wait until the events service is healthy.
+events_healthy() {
+  [ "$(dc ps --format '{{.Service}} {{.Health}}' | awk '$1 == "events" { print $2 }')" = "healthy" ]
+}
+
+# I37: the events service is healthy (it starts after identity accepted its client key).
+test_events_healthy() {
+  events_healthy || { echo "events is not healthy"; dc logs --tail 20 events; return 1; }
+}
+
+# I38: the readiness endpoint of the events service, from the network "services". The service is
+# ready only after identity accepted its client assertion and its manifest.
+test_events_ready() {
+  svc_get http://events:9090/readyz >/dev/null
+}
+
+# I39: a wrong key ID in a second env file. The events service must not become ready, and its log
+# has no private key. After the check, the stack uses the first env file again.
+test_events_wrong_key_id() {
+  local result=0 i key_body
+  sed -e "s|^CONSTELLATION_ENV_FILE=.*|CONSTELLATION_ENV_FILE=$extra_env_file|" \
+    -e 's|^EVENTS_CLIENT_KEY_ID=.*|EVENTS_CLIENT_KEY_ID=events-wrong|' "$env_file" > "$extra_env_file"
+  docker compose -p "$project" --env-file "$extra_env_file" up -d --no-deps --force-recreate events >/dev/null 2>&1 \
+    || { echo "could not recreate events"; result=1; }
+  for ((i = 0; i < 12; i++)); do
+    sleep 5
+    if events_healthy; then
+      echo "events became healthy with a wrong key ID"
+      result=1
+      break
+    fi
+  done
+  key_body="$(sed -n 2p "$key_dir/events-client-key.pem")"
+  if dc logs events 2>&1 | grep -qF -e 'PRIVATE KEY' -e "$key_body"; then
+    echo "the events log has private key text"
+    result=1
+  fi
+  rm -f "$extra_env_file"
+  if ! { dc up -d --no-deps --force-recreate events >/dev/null 2>&1 && poll 120 events_healthy; }; then
+    echo "events did not become healthy after the restore of the first env file"
+    dc logs --tail 20 events
+    result=1
+  fi
+  return "$result"
+}
+
+# Succeed if the text on stdin has an entry ID (the text <ms>-<seq> on one line).
+has_entry_id() {
+  tr -d '\r' | grep -qE '^[0-9]+-[0-9]+$'
+}
+
+# I40 (and I43): a service writes its own stream and not the stream of another app.
+test_stream_write_own() {
+  local pw out
+  pw="$(envval SMOKE_A_VALKEY_PASSWORD)"
+  out="$(vk smoke_a "$pw" XADD events.stream:smoke_a '*' k v 2>&1)"
+  if ! printf '%s\n' "$out" | has_entry_id; then
+    echo "XADD to the own stream gave: $out"
+    return 1
+  fi
+  expect_output NOPERM vk smoke_a "$pw" XADD events.stream:smoke_b '*' k v
+}
+
+# I41 (and I44): a service reads, acks, and cleans up on the stream of another app. It cannot trim
+# or delete that stream. The argument is the name of the consumer group.
+test_stream_consume() {
+  local group="$1" pw out id
+  pw="$(envval SMOKE_A_VALKEY_PASSWORD)"
+  vk_admin XADD events.stream:smoke_b '*' k v >/dev/null || return 1
+  expect_exact OK vk smoke_a "$pw" XGROUP CREATE events.stream:smoke_b "$group" 0 || return 1
+  out="$(vk smoke_a "$pw" XREADGROUP GROUP "$group" c1 COUNT 1 STREAMS events.stream:smoke_b '>' 2>&1 | tr -d '\r')"
+  id="$(printf '%s\n' "$out" | grep -E '^[0-9]+-[0-9]+$' | head -n 1)"
+  if [ -z "$id" ]; then
+    echo "XREADGROUP gave no entry: $out"
+    return 1
+  fi
+  expect_exact 1 vk smoke_a "$pw" XACK events.stream:smoke_b "$group" "$id" || return 1
+  expect_output c1 vk smoke_a "$pw" XINFO CONSUMERS events.stream:smoke_b "$group" || return 1
+  expect_exact 0 vk smoke_a "$pw" XGROUP DELCONSUMER events.stream:smoke_b "$group" c1 || return 1
+  expect_output NOPERM vk smoke_a "$pw" XTRIM events.stream:smoke_b MINID 0 || return 1
+  expect_output NOPERM vk smoke_a "$pw" DEL events.stream:smoke_b
+}
+
+# I42: the user events has the same selectors as each other service user (decision D1).
+test_stream_events_user() {
+  local pw out
+  pw="$(envval EVENTS_VALKEY_PASSWORD)"
+  expect_output NOPERM vk events "$pw" XADD events.stream:smoke_a '*' k v || return 1
+  expect_output NOPERM vk events "$pw" DEL events.stream:smoke_a || return 1
+  expect_output smoke_a vk events "$pw" XINFO GROUPS events.stream:smoke_b || return 1
+  out="$(vk events "$pw" XADD events.stream:events '*' k v 2>&1)"
+  if ! printf '%s\n' "$out" | has_entry_id; then
+    echo "XADD to the stream events gave: $out"
+    return 1
+  fi
+}
+
+# I43: the selectors stay after a Valkey restart.
+test_stream_after_restart() {
+  test_valkey_restart || return 1
+  test_stream_write_own
+}
+
+# I44: the selectors stay after a new provisioning run. The user has exactly two selectors.
+test_stream_after_reprovision() {
+  local count
+  test_reprovision || return 1
+  test_stream_consume smoke_a.again || return 1
+  count="$(vk_admin ACL LIST 2>&1 | tr -d '\r' | grep '^user smoke_a ' | grep -o '(~' | wc -l | tr -d ' ')"
+  if [ "$count" != "2" ]; then
+    echo "the user smoke_a has $count selectors, not 2"
+    return 1
+  fi
+}
+
+# I45: the database role and the Valkey user of the events service are isolated.
+test_events_isolation() {
+  local pw
+  pw="$(envval EVENTS_VALKEY_PASSWORD)"
+  expect_refused CONNECT pg events "$(envval EVENTS_DB_PASSWORD)" identity -c 'SELECT 1' || return 1
+  expect_output NOPERM vk events "$pw" GET identity:k || return 1
+  expect_exact OK vk events "$pw" SET events:smoke 1
+}
+
+# I46: the log of the events service has no password, no private key, and no token.
+test_events_no_secret_in_logs() {
+  local logs key_body name
+  logs="$(dc logs events 2>&1)" || return 1
+  key_body="$(sed -n 2p "$key_dir/events-client-key.pem")"
+  for name in EVENTS_DB_PASSWORD EVENTS_VALKEY_PASSWORD; do
+    if printf '%s' "$logs" | grep -qF -- "$(envval "$name")"; then
+      echo "the events log has the value of $name"
+      return 1
+    fi
+  done
+  if printf '%s' "$logs" | grep -qF -e 'PRIVATE KEY' -e "$key_body" -e 'eyJ'; then
+    echo "the events log has a private key or a token"
+    return 1
+  fi
+}
+
+# I47: identity does not start when the clients file is missing, and Docker makes no directory.
+test_identity_missing_clients_file() {
+  local missing out
+  missing="${IDENTITY_CLIENTS_PATH%/*}/missing/identity-clients.yaml"
+  if out="$(IDENTITY_CLIENTS_PATH="$missing" dc run --rm --no-deps -T identity 2>&1)"; then
+    echo "identity started with a missing clients file"
+    return 1
+  fi
+  if printf '%s' "$out" | grep -qF -- "$missing"; then
+    # Docker refused the mount. It must not make the path.
+    if [ -e "$key_dir/missing" ]; then
+      echo "Docker made the path of the missing clients file"
+      return 1
+    fi
+  elif printf '%s' "$out" | grep -qF 'is a directory'; then
+    # Docker Desktop makes the path and ignores create_host_path: false. Identity still stops.
+    echo "note: this Docker host made the path as a directory. Identity stopped with an error."
+  else
+    echo "the output does not name the path $missing"
+    printf '%s
+' "$out"
+    return 1
+  fi
+}
+
+make_keys || { echo "FAIL: the keys of identity and events"; exit 1; }
 
 # Remove a project of an earlier run.
 dc down -v --remove-orphans >/dev/null 2>&1
@@ -750,6 +922,17 @@ run_check "I35: identity set-idp-secret" test_identity_set_idp_secret
 run_check "I29: no secret in the identity log" test_identity_no_secret_in_logs
 run_check "I31: identity rate limit of GET /setup" test_identity_setup_rate_limit
 run_check "I36: identity with a Google client ID" test_identity_google_enabled
+run_check "I37: events is healthy" test_events_healthy
+run_check "I38: events readiness endpoint" test_events_ready
+run_check "I40: stream write on the own stream only" test_stream_write_own
+run_check "I41: stream consume on the stream of another app" test_stream_consume smoke_a
+run_check "I42: the user events has the same selectors" test_stream_events_user
+run_check "I45: events database and Valkey isolation" test_events_isolation
+run_check "I43: stream selectors after a Valkey restart" test_stream_after_restart
+run_check "I44: stream selectors after a provisioning run" test_stream_after_reprovision
+run_check "I47: identity with a missing clients file" test_identity_missing_clients_file
+run_check "I39: events with a wrong key ID" test_events_wrong_key_id
+run_check "I46: no secret in the events log" test_events_no_secret_in_logs
 
 if [ "${#failures[@]}" -ne 0 ]; then
   echo "smoke-test: ${#failures[@]} check(s) failed: ${failures[*]}"
