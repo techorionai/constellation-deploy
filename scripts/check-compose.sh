@@ -105,15 +105,16 @@ fi
 
 # 5. Each password, secret, token, and key in .env.example is a placeholder.
 # The variable name has the word PASSWORD, SECRET, TOKEN, or KEY between underscores.
-# Two exact names hold no secret: IDENTITY_MASTER_KEY_FILE (a path) and IDENTITY_MASTER_KEY_ID
-# (an identifier). They can have any value. No other name is exempt.
+# Four exact names hold no secret: IDENTITY_MASTER_KEY_FILE and EVENTS_CLIENT_KEY_FILE (paths),
+# IDENTITY_MASTER_KEY_ID and EVENTS_CLIENT_KEY_ID
+# (identifiers). They can have any value. No other name is exempt.
 secret_re='^([A-Za-z0-9_]*_)?(PASSWORD|SECRET|TOKEN|KEY)(_[A-Za-z0-9_]*)?='
 if [ -f "$example_file" ]; then
   while IFS= read -r line; do
     name="${line%%=*}"
     value="${line#*=}"
     case "$name" in
-      IDENTITY_MASTER_KEY_FILE | IDENTITY_MASTER_KEY_ID) continue ;;
+      IDENTITY_MASTER_KEY_FILE | IDENTITY_MASTER_KEY_ID | EVENTS_CLIENT_KEY_FILE | EVENTS_CLIENT_KEY_ID) continue ;;
     esac
     if [ "$value" != "change-me" ]; then
       fail example-secret "$name"
