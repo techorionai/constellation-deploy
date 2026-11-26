@@ -511,9 +511,13 @@ test_identity_setup_log() {
 test_identity_no_secret_in_logs() {
   local logs value name
   logs="$(dc logs identity 2>&1)" || return 1
-  # I35 stores a test client secret. It must not be in the log.
+  # I35 stores a test client secret. It must not be in the log, and not in the stderr of I35.
   if printf '%s' "$logs" | grep -qF -- "$idp_test_secret"; then
     echo "the log has the test client secret"
+    return 1
+  fi
+  if [ -f "$key_dir/idp-stderr" ] && grep -qF -- "$idp_test_secret" "$key_dir/idp-stderr"; then
+    echo "the stderr of set-idp-secret has the test client secret"
     return 1
   fi
   for name in IDENTITY_DB_PASSWORD IDENTITY_VALKEY_PASSWORD; do
@@ -558,7 +562,6 @@ test_identity_setup_rate_limit() {
     return 1
   fi
 }
-
 
 # Test value for the client secret of check I35. It is for tests only. I29 looks for it in the log.
 idp_test_secret="smoke-idp-secret-0123456789"
@@ -616,9 +619,10 @@ test_identity_unlock_login() {
 }
 
 # I35: set-idp-secret reads stdin. A value gives exit 0 and "stored". Empty stdin gives exit 2.
+# The stderr of the command goes to a file in the key folder. I29 looks for the test secret in it.
 test_identity_set_idp_secret() {
   local out code
-  out="$(printf '%s\n' "$idp_test_secret" | dc exec -T identity /identity set-idp-secret google 2>/dev/null)"
+  out="$(printf '%s\n' "$idp_test_secret" | dc exec -T identity /identity set-idp-secret google 2>"$key_dir/idp-stderr")"
   code=$?
   out="$(printf '%s' "$out" | tr -d '\r')"
   if [ "$code" != "0" ] || [ "$out" != "stored" ]; then
@@ -644,7 +648,7 @@ identity_healthy() {
 # This check runs after I35 and after all other identity checks.
 test_identity_google_enabled() {
   local result=0 out
-  cp "$env_file" "$extra_env_file"
+  sed -e "s|^CONSTELLATION_ENV_FILE=.*|CONSTELLATION_ENV_FILE=$extra_env_file|" "$env_file" > "$extra_env_file"
   echo "IDENTITY_GOOGLE_CLIENT_ID=smoke-test-client.apps.googleusercontent.com" >> "$extra_env_file"
   if docker compose -p "$project" --env-file "$extra_env_file" up -d --no-deps --force-recreate identity >/dev/null 2>&1 \
     && poll 120 identity_healthy; then
@@ -662,15 +666,24 @@ test_identity_google_enabled() {
       echo "GET /login/oidc/microsoft did not give 404: $(printf '%s\n' "$out" | head -n 1)"
       result=1
     fi
+    # The log of the identity container that started with the provider on has no test secret.
+    if dc logs identity 2>&1 | grep -qF -- "$idp_test_secret"; then
+      echo "the log of identity with a Google client ID has the test client secret"
+      result=1
+    fi
   else
     echo "identity did not become healthy with a Google client ID"
     dc logs --tail 20 identity
     result=1
   fi
   rm -f "$extra_env_file"
-  dc up -d --no-deps --force-recreate identity >/dev/null 2>&1 && poll 120 identity_healthy || result=1
+  if ! { dc up -d --no-deps --force-recreate identity >/dev/null 2>&1 && poll 120 identity_healthy; }; then
+    echo "identity did not become healthy after the restore of the first env file"
+    result=1
+  fi
   return "$result"
 }
+
 make_master_key || { echo "FAIL: the master key of identity"; exit 1; }
 
 # Remove a project of an earlier run.
