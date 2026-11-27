@@ -47,7 +47,8 @@ All settings are in `.env`. Compose reads `.env` in the project folder. The vari
 | `POSTGRES_USER`, `POSTGRES_PASSWORD` | `postgres`, none | PostgreSQL admin. |
 | `POSTGRES_MAX_CONNECTIONS` | `200` | `max_connections` of PostgreSQL. |
 | `VALKEY_ADMIN_PASSWORD` | none | Password of the Valkey `default` (admin) user. |
-| `VALKEY_MAXMEMORY` | `256mb` | Memory limit of Valkey. |
+| `VALKEY_MAXMEMORY` | `256mb` | Memory limit of Valkey. See "Valkey" for the sizing rules. |
+| `AUDIT_STREAM_RETENTION` | `24h` | Age limit of the audit streams of identity and events. See "Audit stream retention". |
 | `GRAFANA_ADMIN_USER`, `GRAFANA_ADMIN_PASSWORD` | `admin`, none | Grafana admin. |
 | `GRAFANA_SECRET_KEY` | none | Key that Grafana uses to encrypt the secrets in its database. A change later makes the stored data source secrets unreadable. |
 | `SERVICE_DB_CONNECTION_LIMIT` | `50` | Maximum number of connections for each service role in PostgreSQL. Keep the number of services times this value lower than `POSTGRES_MAX_CONNECTIONS`. |
@@ -247,7 +248,15 @@ The service `audit` is the audit service of the platform. It uses the image `ghc
 - The manifest of the audit service has the role `reader`. Identity makes the role `audit:reader`, which gives the permission `audit:log:read`. Give this role to the person or the service that searches and exports audit entries.
 - Pool rule: the service needs `AUDIT_DATABASE__MAX_CONNS` of at least `4 + 2 x AUDIT_EXPORT__CONCURRENCY`. The default concurrency is 2, so the minimum is 8. `compose.yaml` sets `AUDIT_DATABASE__MAX_CONNS` to 8. If you set a higher `AUDIT_EXPORT__CONCURRENCY`, also set a higher `AUDIT_DATABASE__MAX_CONNS`. Else the service stops with a configuration error. The value must stay lower than `SERVICE_DB_CONNECTION_LIMIT`.
 - `AUDIT_HTTP__TRUSTED_PROXIES` stays empty in `compose.yaml`, because the service has no proxy. If a caller that is not a proxy could send forwarded headers, the caller could write a false IP address into its own export entry. If you add a reverse proxy in front of the audit service, set `AUDIT_HTTP__TRUSTED_PROXIES` to the CIDR of the proxy.
-- The images of identity and events in this release have no audit writer. They write audit entries after an update to `constellation-platform-go` `v0.7.0` and a new image.
+- The images of identity `0.8.0` and events `0.2.0` write audit entries to the Valkey streams `audit.stream:identity` and `audit.stream:events`. See "Audit stream retention".
+
+## Audit stream retention
+
+Identity and events trim their audit stream by age. `compose.yaml` sets `IDENTITY_RETENTION__AUDIT_STREAM__PERIOD` and `EVENTS_RETENTION__AUDIT_STREAM__PERIOD` to `AUDIT_STREAM_RETENTION`. The default is `24h`. The image default is `168h`.
+
+- The trim also deletes entries that the audit service did not read. If the audit service stops for longer than the period, the platform loses audit entries without a sign. Set `AUDIT_STREAM_RETENTION` to a value that is longer than the longest stop of the audit service. After a stop, examine the audit service and make it read the streams before the period ends.
+- A short period keeps the streams small. Identity writes a `denied` audit entry for each failed request to `/oauth/token`. An unauthenticated caller can make these entries. The rate limit allows 600 requests per minute for each IP. Identity has no limit for these entries. The only limit is the retention period and `VALKEY_MAXMEMORY`. See "Valkey" for the sizing rules.
+- The outbox tables of identity and events keep their image default of `168h`. A row that is not published stays.
 
 ## Audit stream ACL
 
@@ -390,6 +399,14 @@ The internal network has no TLS. With `sslmode=disable`, `constellation-platform
 ## Valkey
 
 Valkey runs with AOF (`appendonly yes`) and `maxmemory-policy noeviction`. Streams must not lose events. When the memory is full, write commands return an error and Valkey does not remove keys. Set `VALKEY_MAXMEMORY` to a value that fits your data.
+
+Sizing rules for `VALKEY_MAXMEMORY`:
+
+- Valkey holds the event streams, the audit streams, the login counters, the authorization codes, and the rate limit keys. When the memory is full, all writes of all services fail.
+- Audit streams: plan for the audit entries of `AUDIT_STREAM_RETENTION` (see "Audit stream retention"). A failed token request makes one entry of approximately 1 KB. The rate limit of 600 requests per minute for each IP gives approximately 860000 entries for each IP in `24h`, about 860 MB. Use the number of IPs that you expect, and add a rate limit in the reverse proxy.
+- Use the longer of `AUDIT_STREAM_RETENTION` and the longest stop of the audit service. Do not make it shorter to save memory.
+- Add the memory of the event streams and the other keys. Then add at least 25 percent of free memory. The AOF rewrite also needs memory.
+- Watch `used_memory` and `maxmemory` in the metrics. Raise `VALKEY_MAXMEMORY` before `used_memory` is at 80 percent of it.
 
 `valkey-server` does not run as root. A first start with an empty `valkey-data` volume writes the ACL file with the `default` user and the SHA-256 hash of `VALKEY_ADMIN_PASSWORD`. A later start does not change the file. `provision-valkey` always runs `ACL SAVE`, also with no service, so an old ACL file with a plain text password changes to a hash.
 

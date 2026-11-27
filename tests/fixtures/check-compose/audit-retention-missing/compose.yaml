@@ -1,0 +1,5 @@
+services:
+  identity:
+    image: ghcr.io/techorionai/constellation-identity:0.8.0
+    environment:
+      IDENTITY_ISSUER: http://localhost
