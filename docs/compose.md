@@ -463,3 +463,5 @@ The release `v0.4.0` adds the audit service and the audit stream ACL. Do these s
 5. Restart identity, because it reads the clients file only at the start: `docker compose restart identity`.
 6. Run `docker compose pull`, `docker compose run --rm provision-postgres`, and `docker compose run --rm provision-valkey`, then `docker compose up -d`. Without the run of `provision-valkey`, the Valkey users keep the old ACL.
 7. Examine the states with `docker compose ps`. The service `audit` shows `healthy`.
+
+The audit service adds one more service role in PostgreSQL. Each service role can use up to `SERVICE_DB_CONNECTION_LIMIT` (default 50) connections. Keep the number of services times this value lower than `POSTGRES_MAX_CONNECTIONS`. Increase `POSTGRES_MAX_CONNECTIONS` before you add a service if the total is not lower.

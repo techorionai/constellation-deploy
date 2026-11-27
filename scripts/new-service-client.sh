@@ -63,6 +63,8 @@ case "$svc" in
   *,*) die "bad service name: $svc" ;;
   identity) die "the name identity is not allowed for a service client" ;;
 esac
+# Use postgres.sh and not valkey.sh for the name check. valkey.sh --check-names also checks
+# AUDIT_STREAM_READER, which is not input of this script. The name rule is the same.
 sh "$repo_root/provision/postgres.sh" --check-names "$svc" 2>/dev/null || die "bad service name: $svc"
 [ -n "$kid" ] || kid="$svc-1"
 [[ "$kid" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || die "bad key ID: $kid"

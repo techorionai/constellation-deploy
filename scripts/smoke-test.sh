@@ -813,6 +813,24 @@ test_stream_events_user() {
     echo "XADD to the stream events gave: $out"
     return 1
   fi
+  # The audit producer selectors: the user events writes its own audit stream and not the audit
+  # stream of another app. It cannot read audit streams or list the set.
+  out="$(vk events "$pw" XADD audit.stream:events '*' k v 2>&1)"
+  if ! printf '%s\n' "$out" | has_entry_id; then
+    echo "XADD to the own audit stream gave: $out"
+    return 1
+  fi
+  expect_output NOPERM vk events "$pw" XADD audit.stream:smoke_a '*' k v || return 1
+  expect_output NOPERM vk events "$pw" XRANGE audit.stream:events - + || return 1
+  expect_output NOPERM vk events "$pw" SSCAN audit.streams 0 || return 1
+  # The reader user audit has the event selectors and the reader selectors.
+  pw="$(envval AUDIT_VALKEY_PASSWORD)"
+  vk_admin SADD audit.streams smoke_a >/dev/null || return 1
+  expect_exact OK vk audit "$pw" XGROUP CREATE events.stream:smoke_b smoke_audit_events_check 0 || return 1
+  expect_output smoke_audit_events_check vk audit "$pw" XINFO GROUPS events.stream:smoke_b || return 1
+  expect_output smoke_a vk audit "$pw" SSCAN audit.streams 0 || return 1
+  expect_output NOPERM vk audit "$pw" XADD audit.stream:smoke_a '*' k v || return 1
+  expect_output NOPERM vk audit "$pw" XADD events.stream:smoke_b '*' k v
 }
 
 # I43: the selectors stay after a Valkey restart.
@@ -871,7 +889,9 @@ audit_healthy() {
 }
 
 # I49: the audit service is healthy and its readiness endpoint gives 200. It is ready only after
-# identity accepted its client assertion and its manifest.
+# identity accepted its client assertion and its manifest, so the readiness check also proves that
+# identity has the manifest of audit. A direct check of the manifest in identity needs a token with
+# the right permission and is not practical in this test (decision mode Auto, base rule).
 test_audit_healthy() {
   audit_healthy || { echo "audit is not healthy"; dc logs --tail 20 audit; return 1; }
   svc_get http://audit:9090/readyz >/dev/null
@@ -912,6 +932,8 @@ test_audit_reader() {
   expect_exact OK vk audit "$pw" XGROUP CREATE audit.stream:smoke_a smoke_reader_check 0 || return 1
   expect_output smoke_reader_check vk audit "$pw" XINFO GROUPS audit.stream:smoke_a || return 1
   expect_output smoke_a vk audit "$pw" SSCAN audit.streams 0 || return 1
+  # XREADGROUP needs +xreadgroup in the reader selector.
+  expect_output audit.stream:smoke_a vk audit "$pw" XREADGROUP GROUP smoke_reader_check c1 COUNT 1 STREAMS audit.stream:smoke_a '>' || return 1
   expect_output NOPERM vk audit "$pw" XADD audit.stream:smoke_a '*' k v
 }
 
@@ -960,6 +982,11 @@ selector_count() {
   vk_admin ACL LIST 2>&1 | tr -d '\r' | grep "^user $1 " | grep -o '(~' | wc -l | tr -d ' '
 }
 
+# The names of the Valkey users that have the selector (~audit.streams +sscan).
+reader_selector_users() {
+  vk_admin ACL LIST 2>&1 | tr -d '\r' | grep -E '\(~audit\.streams [^)]*\+sscan\)' | awk '{ print $2 }'
+}
+
 # I54: AUDIT_STREAM_READER=events in a second env file. After a provisioning run, the user events
 # has the reader selectors and the user audit has not. After the check, the first env file
 # is used again.
@@ -973,10 +1000,18 @@ test_audit_reader_variable() {
     echo "events has $(selector_count events) selectors and audit has $(selector_count audit), not 6 and 4"
     result=1
   fi
+  if ! reader_selector_users | grep -qx events || reader_selector_users | grep -qx audit; then
+    echo "the selector (~audit.streams +sscan) is not only on the user events"
+    result=1
+  fi
   rm -f "$extra_env_file"
   dc run --rm --no-deps -T provision-valkey >/dev/null 2>&1 || { echo "provision-valkey failed after the restore"; result=1; }
   if [ "$(selector_count audit)" != "6" ] || [ "$(selector_count events)" != "4" ]; then
     echo "the restore did not give 6 selectors to audit and 4 to events"
+    result=1
+  fi
+  if ! reader_selector_users | grep -qx audit || reader_selector_users | grep -qx events; then
+    echo "the selector (~audit.streams +sscan) is not only on the user audit after the restore"
     result=1
   fi
   return "$result"

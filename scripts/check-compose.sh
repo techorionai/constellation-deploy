@@ -157,8 +157,13 @@ reader_check '' identity,events,audit 0
 reader_check crm identity,events,audit 1
 reader_check Bad identity,events,audit 1
 reader_check unset identity,events 1
-if ! AUDIT_STREAM_READER=crm sh "$repo_root/provision/valkey.sh" --check-names identity,events,audit 2>&1 | grep -q AUDIT_STREAM_READER; then
-  fail provision-reader "the message does not name AUDIT_STREAM_READER"
+for reader_value in crm Bad; do
+  if ! AUDIT_STREAM_READER="$reader_value" sh "$repo_root/provision/valkey.sh" --check-names identity,events,audit 2>&1 | grep -q AUDIT_STREAM_READER; then
+    fail provision-reader "the message for AUDIT_STREAM_READER=$reader_value does not name AUDIT_STREAM_READER"
+  fi
+done
+if ! env -u AUDIT_STREAM_READER sh "$repo_root/provision/valkey.sh" --check-names identity,events 2>&1 | grep -q AUDIT_STREAM_READER; then
+  fail provision-reader "the message for a reader that is not in the list does not name AUDIT_STREAM_READER"
 fi
 
 # 7. No shell file has a CR character.
