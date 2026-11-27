@@ -919,19 +919,30 @@ test_stream_after_reprovision() {
   fi
 }
 
-# I60: a bad member in audit.apps. The script does not delete it, does not print it, and exits 0.
+# I60: two bad members in audit.apps, "Bad-name" and "*". The script does not delete them, does not
+# print them, and exits 0. The member "*" must not expand to file names in the shell of the script.
 test_audit_apps_bad_member() {
-  local output name count
-  vk_admin SADD audit.apps Bad-name >/dev/null || return 1
-  output="$(dc run --rm --no-deps -T provision-valkey 2>&1)" || { printf '%s\n' "$output"; vk_admin SREM audit.apps Bad-name >/dev/null; return 1; }
-  vk_admin SISMEMBER audit.apps Bad-name | grep -q '^1' || { echo "Bad-name was deleted"; return 1; }
-  vk_admin SREM audit.apps Bad-name >/dev/null || return 1
-  if ! printf '%s\n' "$output" | grep -qF "WARNING: valkey: audit.apps has a bad name, not deleted"; then
-    echo "no warning in the output: $output"
+  local output name warnings
+  vk_admin SADD audit.apps Bad-name '*' >/dev/null || return 1
+  output="$(dc run --rm --no-deps -T provision-valkey 2>&1)" || { printf '%s\n' "$output"; vk_admin SREM audit.apps Bad-name '*' >/dev/null; return 1; }
+  if [ "$(vk_admin SISMEMBER audit.apps Bad-name | tr -d '\r')" != "1" ]; then
+    echo "Bad-name was deleted"
+    vk_admin SREM audit.apps '*' >/dev/null
     return 1
   fi
-  if printf '%s\n' "$output" | grep -qF "Bad-name"; then
-    echo "the output has the bad name"
+  if [ "$(vk_admin SISMEMBER audit.apps '*' | tr -d '\r')" != "1" ]; then
+    echo "the member * was deleted"
+    vk_admin SREM audit.apps Bad-name >/dev/null
+    return 1
+  fi
+  vk_admin SREM audit.apps Bad-name '*' >/dev/null || return 1
+  warnings="$(printf '%s\n' "$output" | grep -cF "WARNING: valkey: audit.apps has a bad name, not deleted" || true)"
+  if [ "$warnings" != "2" ]; then
+    echo "expected 2 warnings, got $warnings: $output"
+    return 1
+  fi
+  if printf '%s\n' "$output" | grep -qF -e "Bad-name" -e "unregistered"; then
+    echo "the output has a bad name or an unregistered line: $output"
     return 1
   fi
   for name in smoke_a smoke_b identity events audit; do
