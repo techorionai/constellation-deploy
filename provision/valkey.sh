@@ -1,5 +1,6 @@
 #!/bin/sh
 # Make one Valkey ACL user for each name in CONSTELLATION_SERVICES.
+# Also register each name in the trusted set "audit.apps", and delete the other names from it.
 # The script is idempotent. The "reset" keyword gives the same result on a second run.
 #
 # Usage:
@@ -100,10 +101,14 @@ expect_ok() {
 # The first selector lets the service write and trim only its own stream. The second selector
 # lets the service read, ack, and claim on every stream. The ACL cannot isolate consumer groups.
 #
-# Each user also gets two selectors to write audit entries. They are the same as
-# AuditProducerSelectors(app) of platform-go v0.7.0. The user that AUDIT_STREAM_READER names
-# also gets the two selectors of AuditReaderSelectors(). Only this user reads audit streams.
-# The reader lists the set "audit.streams" with SSCAN, not SMEMBERS.
+# Each user also gets two selectors to write audit entries. The first is the same as
+# AuditProducerSelectors(app) of platform-go v0.9.0. The second selector is for the transition
+# of decision D12 of platform-go#29: identity and events use platform-go v0.7.0 and send
+# SADD audit.streams. The user that AUDIT_STREAM_READER names
+# also gets the selectors of AuditReaderSelectors() of v0.9.0, and the old selector
+# "(~audit.streams +sscan)" for the transition. Only this user reads audit streams.
+# The reader lists the set "audit.apps" with SSCAN, not SMEMBERS. No selector has +srem.
+# A later release deletes the two audit.streams selectors, when all producers use v0.9.0.
 # Each selector is in quotes, because valkey-cli splits the rule at spaces.
 provision() {
   svc="$1"
@@ -112,7 +117,7 @@ provision() {
   hash=$(printf '%s' "$pw" | sha256sum | cut -d' ' -f1)
   audit_sel="\"(~audit.stream:$svc +xadd +xtrim)\" \"(~audit.streams +sadd)\""
   if [ "$svc" = "$audit_reader" ]; then
-    audit_sel="$audit_sel \"(~audit.stream:* +xreadgroup +xack +xautoclaim +xpending +xinfo|groups +xinfo|stream +xinfo|consumers +xgroup|create +xgroup|createconsumer +xgroup|delconsumer +xrange)\" \"(~audit.streams +sscan)\""
+    audit_sel="$audit_sel \"(~audit.stream:* +xreadgroup +xack +xautoclaim +xpending +xinfo|groups +xinfo|stream +xinfo|consumers +xgroup|create +xgroup|createconsumer +xgroup|delconsumer +xrange)\" \"(~audit.apps +sscan)\" \"(~audit.streams +sscan)\""
   fi
   reply=$(cli "ACL SETUSER $svc reset on #$hash ~$svc:* +@all -@admin -@dangerous -@scripting -function -scan -randomkey -dbsize -memory \"(~events.stream:$svc +xadd +xtrim)\" \"(~events.stream:* +xreadgroup +xack +xautoclaim +xpending +xinfo|groups +xinfo|stream +xinfo|consumers +xgroup|create +xgroup|createconsumer +xgroup|delconsumer +xrange)\" $audit_sel")
   expect_ok "$reply"
@@ -134,3 +139,65 @@ fi
 # This also replaces an old ACL file that has the admin password in plain text.
 reply=$(cli "ACL SAVE")
 expect_ok "$reply"
+
+# Register each service in the trusted set "audit.apps". Only the admin user writes this set.
+# SADD is idempotent, so a second run gives the same result.
+check_01() {
+  case "$1" in
+    0 | 1) ;;
+    *)
+      echo "ERROR: valkey: unexpected reply: $1" >&2
+      exit 1
+      ;;
+  esac
+}
+
+if [ -n "$services" ]; then
+  rest="$services,"
+  while [ -n "$rest" ]; do
+    name="${rest%%,*}"
+    rest="${rest#*,}"
+    reply=$(cli "SISMEMBER audit.apps $name")
+    check_01 "$reply"
+    if [ "$reply" = "0" ]; then
+      reply=$(cli "SADD audit.apps $name")
+      check_01 "$reply"
+      echo "valkey: registered $name"
+    fi
+  done
+fi
+
+# Delete the names that are not in the service list. The script deletes no ACL user and no stream.
+reply=$(cli "TYPE audit.apps")
+case "$reply" in
+  none) ;;
+  set)
+    members=$(cli "SMEMBERS audit.apps")
+    old_ifs="$IFS"
+    IFS='
+'
+    # Turn off pathname globbing. A member such as "*" must not expand to file names.
+    set -f
+    for member in $members; do
+      [ -n "$member" ] || continue
+      if ! check_name "$member"; then
+        echo "WARNING: valkey: audit.apps has a bad name, not deleted" >&2
+        continue
+      fi
+      case ",$services," in
+        *",$member,"*) continue ;;
+      esac
+      reply=$(cli "SREM audit.apps $member")
+      check_01 "$reply"
+      if [ "$reply" = "1" ]; then
+        echo "valkey: unregistered $member"
+      fi
+    done
+    set +f
+    IFS="$old_ifs"
+    ;;
+  *)
+    echo "ERROR: valkey: unexpected reply: $reply" >&2
+    exit 1
+    ;;
+esac

@@ -101,7 +101,7 @@ Limit: Loki, Tempo, Prometheus, and the collector have no authentication. A plat
 
 ## Identity
 
-The service `identity` is the identity provider of the platform. It uses the image `ghcr.io/techorionai/constellation-identity:0.8.0`. It uses the database `identity` and the Valkey user `identity` that the provisioning services make from the name `identity` in `CONSTELLATION_SERVICES`.
+The service `identity` is the identity provider of the platform. It uses the image `ghcr.io/techorionai/constellation-identity:0.9.0`. It uses the database `identity` and the Valkey user `identity` that the provisioning services make from the name `identity` in `CONSTELLATION_SERVICES`.
 
 ### Master key
 
@@ -132,7 +132,7 @@ The command `install -d -m 0700` does not change the mode of a folder that exist
 - With a reverse proxy, set `IDENTITY_TRUSTED_PROXIES` in `.env` to the CIDR of the proxy. Identity then uses `X-Forwarded-For` from the proxy. If you do not set it, identity sees the proxy address as the client address of all users. They then share one login lockout (50 failures in 15 minutes), and the audit log has the proxy address.
 - The values of `IDENTITY_DB_PASSWORD_URLENCODED` and `IDENTITY_VALKEY_PASSWORD` are plain environment values of the container. A user of `docker inspect` can read them. Such a user has Docker access, which is almost root. The base services do the same for their admin passwords. Identity has no `_FILE` form for these values. This is a known limit.
 - Identity limits the requests to its public endpoints with counters in Valkey. Valkey must be healthy. Most limits fail closed with status 503 when Valkey is down. The defaults need no setting. `IDENTITY_RATE_LIMIT__ENABLED`, `IDENTITY_RATE_LIMIT__<BUCKET>__LIMIT`, and `IDENTITY_RATE_LIMIT__<BUCKET>__WINDOW` are optional. The bucket `idp` counts the start and the callback of the upstream login. It gives 30 requests in 1 minute for one IP. Compose does not pass `IDENTITY_IDP__HTTP_TIMEOUT` (one deadline for all outbound calls of one request to a provider, default `10s`, range `1s` to `25s`). To change it, add `IDENTITY_IDP__HTTP_TIMEOUT: ${IDENTITY_IDP_HTTP_TIMEOUT:-10s}` to the identity `environment` in `compose.yaml` and set `IDENTITY_IDP_HTTP_TIMEOUT` in `.env`. Add `IDENTITY_RATE_LIMIT__*` settings in the same way.
-- The limits use the client IP. Behind a proxy without `IDENTITY_TRUSTED_PROXIES`, all clients share the limits of the proxy address, also the bucket `idp`. Each trusted proxy must append the address of its peer to `X-Forwarded-For`.
+- The limits use the client IP. Behind a proxy without `IDENTITY_TRUSTED_PROXIES`, all clients share the limits of the proxy address, also the bucket `idp` and the bucket `token_denied`. The gate for denied audit entries stays on when `IDENTITY_RATE_LIMIT__ENABLED=false`. Each trusted proxy must append the address of its peer to `X-Forwarded-For`.
 - To remove the login lock of one email, run `docker compose exec identity /identity unlock-login <email>`.
 - An admin with no MFA must set up TOTP or register a passkey at the next login. This rule is on by default. The Compose file does not pass `IDENTITY_MFA__REQUIRE_FOR_ADMINS` to the container, so you cannot change the rule in `.env`. The service seals the TOTP secrets with the master key of identity. After the upgrade, each admin must set up TOTP or register a passkey at once. Until then, a person who knows the password of the admin can set up the second factor.
 - To remove the TOTP factor, the recovery codes, and all passkeys of a user who lost the device and the recovery codes, or a user with passkeys only (such a user has no recovery codes), run `docker compose exec identity /identity reset-mfa <email>`. Before you run it, check the identity of the requester outside the service, for example in person or by a call. After the reset, the password alone gives a login and a new second factor. The user must set up TOTP or register a passkey at once.
@@ -242,37 +242,40 @@ An existing install gets the selectors after `docker compose run --rm provision-
 
 ## Audit service
 
-The service `audit` is the audit service of the platform. It uses the image `ghcr.io/techorionai/constellation-audit:0.1.0`, the database `audit`, and the Valkey user `audit`. It has no published port. Only services on the network `services` call it. Its API port `8080` and its admin port `9090` are not published.
+The service `audit` is the audit service of the platform. It uses the image `ghcr.io/techorionai/constellation-audit:0.2.0`, the database `audit`, and the Valkey user `audit`. It has no published port. Only services on the network `services` call it. Its API port `8080` and its admin port `9090` are not published.
 
 - It is a service client with no role. It reads the private key as the Compose secret `audit_client_key` from the file `AUDIT_CLIENT_KEY_FILE`. It is ready only after it publishes its manifest to identity. If `readyz` does not give 200, examine `AUDIT_CLIENT_KEY_ID` and the clients file first.
 - The manifest of the audit service has the role `reader`. Identity makes the role `audit:reader`, which gives the permission `audit:log:read`. Give this role to the person or the service that searches and exports audit entries.
 - Pool rule: the service needs `AUDIT_DATABASE__MAX_CONNS` of at least `4 + 2 x AUDIT_EXPORT__CONCURRENCY`. The default concurrency is 2, so the minimum is 8. `compose.yaml` sets `AUDIT_DATABASE__MAX_CONNS` to 8. If you set a higher `AUDIT_EXPORT__CONCURRENCY`, also set a higher `AUDIT_DATABASE__MAX_CONNS`. Else the service stops with a configuration error. The value must stay lower than `SERVICE_DB_CONNECTION_LIMIT`.
 - `AUDIT_HTTP__TRUSTED_PROXIES` stays empty in `compose.yaml`, because the service has no proxy. If a caller that is not a proxy could send forwarded headers, the caller could write a false IP address into its own export entry. If you add a reverse proxy in front of the audit service, set `AUDIT_HTTP__TRUSTED_PROXIES` to the CIDR of the proxy.
-- The images of identity `0.8.0` and events `0.2.0` write audit entries to the Valkey streams `audit.stream:identity` and `audit.stream:events`. See "Audit stream retention".
+- The images of identity `0.9.0` and events `0.2.0` write audit entries to the Valkey streams `audit.stream:identity` and `audit.stream:events`. See "Audit stream retention".
 
 ## Audit stream retention
 
 Identity and events trim their audit stream by age. `compose.yaml` sets `IDENTITY_RETENTION__AUDIT_STREAM__PERIOD` and `EVENTS_RETENTION__AUDIT_STREAM__PERIOD` to `AUDIT_STREAM_RETENTION`. The default is `24h`. The image default is `168h`.
 
 - The trim also deletes entries that the audit service did not read. If the audit service stops for longer than the period, the platform loses audit entries without a sign. Set `AUDIT_STREAM_RETENTION` to a value that is longer than the longest stop of the audit service. After a stop, examine the audit service and make it read the streams before the period ends.
-- A short period keeps the streams small. Identity writes a `denied` audit entry for each failed request to `/oauth/token`. An unauthenticated caller can make these entries. The rate limit allows 600 requests per minute for each IP. Identity has no limit for these entries. The only limit is the retention period and `VALKEY_MAXMEMORY`. See "Valkey" for the sizing rules.
+- A short period keeps the streams small. Identity writes a `denied` audit entry for each failed request to `/oauth/token`. An unauthenticated caller can make these entries. Identity `0.9.0` limits them with four buckets. A request of an unauthenticated caller goes through `token_denied` (30 in 1 minute for each IP), `token_denied_daily` (1000 in 24 hours for each IP), and `token_denied_global` (100000 in 24 hours). A request of a client that authenticated goes through `token_denied` and `token_denied_client` (600 in 1 hour for each client ID). The counter `identity.audit.denied_dropped` counts the dropped entries, with the `reason` values `rate_limit_token_denied`, `rate_limit_token_denied_daily`, `rate_limit_token_denied_global`, `rate_limit_token_denied_client`, `rate_limit_admin_denied`, `rate_limit_admin_denied_daily`, and `fallback_limit`. Watch it in Grafana. An attacker can use up the global bucket and stop the denied token entries of unauthenticated callers for 24 hours. The denied token entries of authenticated clients still pass. Behind a proxy without `IDENTITY_TRUSTED_PROXIES`, all clients share one `token_denied` bucket. See "Valkey" for the sizing rules.
 - The outbox tables of identity and events keep their image default of `168h`. A row that is not published stays.
 
 ## Audit stream ACL
 
-`provision-valkey` gives each Valkey user two selectors to write audit entries. The text is the same as `AuditProducerSelectors(app)` of `constellation-platform-go` `v0.7.0`.
+The text of the selectors is from `constellation-platform-go` `v0.9.0` and decision D12 of `constellation-platform-go#29`. The trusted set `audit.apps` lists the audit apps. Only `provision-valkey` writes it, as the admin user. It registers each name of `CONSTELLATION_SERVICES` and deletes the other names. A producer cannot write `audit.apps`. The reader lists it with `SSCAN` and has no write command. No selector has `+srem`.
 
-- `(~audit.stream:<svc> +xadd +xtrim)` lets a service write and trim only its own audit stream.
-- `(~audit.streams +sadd)` lets a service add its name to the set `audit.streams`.
+`provision-valkey` gives each Valkey user two selectors to write audit entries.
 
-Only the user that `AUDIT_STREAM_READER` names also gets the two reader selectors of `AuditReaderSelectors()`. The default is `audit`.
+- `(~audit.stream:<svc> +xadd +xtrim)` lets a service write and trim only its own audit stream. It is the same as `AuditProducerSelectors(app)`.
+- `(~audit.streams +sadd)` lets a service add its name to the set `audit.streams`. It is for the transition. Identity and events use `constellation-platform-go` `v0.7.0` and send `SADD audit.streams`.
+
+Only the user that `AUDIT_STREAM_READER` names also gets three reader selectors. The default is `audit`.
 
 - `(~audit.stream:* +xreadgroup +xack +xautoclaim +xpending +xinfo|groups +xinfo|stream +xinfo|consumers +xgroup|create +xgroup|createconsumer +xgroup|delconsumer +xrange)` lets the reader read and acknowledge entries on each audit stream.
-- `(~audit.streams +sscan)` lets the reader list the set with `SSCAN`. The ACL does not allow `SMEMBERS`.
+- `(~audit.apps +sscan)` lets the reader list the trusted set with `SSCAN`. The ACL does not allow `SMEMBERS`.
+- `(~audit.streams +sscan)` is for the transition. No function of the audit service `0.2.0` reads `audit.streams`.
 
 `AUDIT_STREAM_READER` must be in `CONSTELLATION_SERVICES` and must follow the name rule. `provision/valkey.sh` checks this before it changes anything. A service that is not the reader cannot read an audit stream or list the set.
 
-Limits: the ACL allows `SADD` with any value, so a producer can add false names to the set. The audit service keeps its known apps in its own table for this reason. The ACL cannot isolate consumer groups on the audit streams, as on the event streams.
+Limits: a producer cannot add a name to `audit.apps`. During the transition, a producer can still add names to `audit.streams`. The names have no effect on the discovery, but they use memory. A later release deletes the two `audit.streams` selectors. `DEL audit.streams` is then an optional manual step. The ACL cannot isolate consumer groups on the audit streams, as on the event streams.
 
 An existing install gets the selectors after `docker compose run --rm provision-valkey`.
 
@@ -310,7 +313,7 @@ Backup: keep a copy of the folder `secrets/`. It has the master key of identity,
 Two one-shot services make the objects. They are idempotent. A second run gives the same result.
 
 - `provision-postgres` makes the role `<svc>` and the database `<svc>` with the role as owner. It removes the `CONNECT` permission of `PUBLIC` and gives it to the role. A service cannot connect to the database of another service. The script also removes `CONNECT` and `TEMP` of `PUBLIC` on the databases `postgres` and `template1`, and it sets `CONNECTION LIMIT` of each role to `SERVICE_DB_CONNECTION_LIMIT`.
-- `provision-valkey` makes the ACL user `<svc>`. The user can use the keys `<svc>:*` and the commands `+@all -@admin -@dangerous -@scripting -function -scan -randomkey -dbsize -memory`. Valkey does not filter `SCAN`, `RANDOMKEY`, `DBSIZE`, and `MEMORY` by key pattern, so they would show the key names of other services. A script (`EVAL`) can block Valkey for all services, so scripts are off. Each user also has two selectors for the event streams (see "Event stream ACL") and two selectors for the audit streams (see "Audit stream ACL"). The reader user has two more. The script saves the users to the ACL file in the `valkey-data` volume, so they stay after a restart. The ACL file has the SHA-256 hash of each password, not the password.
+- `provision-valkey` makes the ACL user `<svc>`. The user can use the keys `<svc>:*` and the commands `+@all -@admin -@dangerous -@scripting -function -scan -randomkey -dbsize -memory`. Valkey does not filter `SCAN`, `RANDOMKEY`, `DBSIZE`, and `MEMORY` by key pattern, so they would show the key names of other services. A script (`EVAL`) can block Valkey for all services, so scripts are off. Each user also has two selectors for the event streams (see "Event stream ACL") and two selectors for the audit streams (see "Audit stream ACL"). The reader user has three more. The script registers each service in the set `audit.apps` (see "Audit stream ACL"). The script saves the users to the ACL file in the `valkey-data` volume, so they stay after a restart. The ACL file has the SHA-256 hash of each password, not the password. When you delete a name from `CONSTELLATION_SERVICES`, `provision-valkey` deletes it from `audit.apps`. The ACL user of the name stays.
 
 The scripts do not print passwords, and they do not put passwords on a command line. The scripts reject the placeholder `change-me`, a password with fewer than 12 characters, and a Valkey password with white space, before they change anything. Services connect to PostgreSQL directly. Do not put a pooler in transaction mode between them, because it breaks the advisory locks of the migrations.
 
@@ -320,7 +323,7 @@ The scripts do not print passwords, and they do not put passwords on a command l
 2. Add `<SVC>_DB_PASSWORD` and `<SVC>_VALKEY_PASSWORD` to `.env`.
 3. If the service gets tokens from identity, run `bash scripts/new-service-client.sh <svc> [role ...]` and follow the steps that it prints (see "Service clients").
 4. Add a service block to `compose.yaml` (the template below). The `events` block is an example of a service client.
-5. A new service gets 4 selectors: two for event streams and two for audit streams. Only the user that `AUDIT_STREAM_READER` names reads audit streams. Do not name a new service as the reader.
+5. A new service gets 4 selectors: two for event streams and two for audit streams. `provision-valkey` registers the new service in `audit.apps`. The audit service does not find a service that is not registered, so run `provision-valkey` before the service starts. Only the user that `AUDIT_STREAM_READER` names reads audit streams. Do not name a new service as the reader.
 6. Run the provisioning services: `docker compose run --rm provision-postgres` and `docker compose run --rm provision-valkey`. Then run `docker compose up -d`. Use `docker compose run --rm` because `docker compose up -d` does not start an exited one-shot container again when its configuration did not change.
 
 Template for a service `identity`. Use the exact version tag of the image in place of `<version>` (for example `0.1.0`). Replace `identity` and `IDENTITY` with the name of the service. URL-encode the password in `DATABASE__URL`. A platform service joins the `services` network only. Add the same hardening as the base services.
@@ -403,7 +406,7 @@ Valkey runs with AOF (`appendonly yes`) and `maxmemory-policy noeviction`. Strea
 Sizing rules for `VALKEY_MAXMEMORY`:
 
 - Valkey holds the event streams, the audit streams, the login counters, the authorization codes, and the rate limit keys. When the memory is full, all writes of all services fail.
-- Audit streams: plan for the audit entries of `AUDIT_STREAM_RETENTION` (see "Audit stream retention"). A failed token request makes one entry of approximately 1 KB. The rate limit of 600 requests per minute for each IP gives approximately 860000 entries for each IP in `24h`, about 860 MB. Use the number of IPs that you expect, and add a rate limit in the reverse proxy.
+- Audit streams: plan for the audit entries of `AUDIT_STREAM_RETENTION` (see "Audit stream retention"). A denied token entry is approximately 1 KB. Identity `0.9.0` limits them. Denied token entries: approximately `(R / 24 + 1) x TOKEN_DENIED_GLOBAL limit x 1 KB`. `R` is the longer of `AUDIT_STREAM_RETENTION` and the longest stop of the audit service, in hours. With the default limit 100000 and `R` = 24, this is approximately 200 MB. Add approximately `(R / 24 + 1) x 14400 x 1 KB` (approximately 14 MB for `R` = 24) for each registered client, for the bucket `token_denied_client`. Add approximately 4800 denied login entries (approximately 5 MB) for each IP that you expect in 24 hours. Add approximately 2 MB of rate limit keys for each IPv6 /48 prefix. When the rate limits are off, the denied token bound is for each replica. Add a rate limit in the reverse proxy. When the memory is full, `provision-valkey` cannot register a new service.
 - Use the longer of `AUDIT_STREAM_RETENTION` and the longest stop of the audit service. Do not make it shorter to save memory.
 - Add the memory of the event streams and the other keys. Then add at least 25 percent of free memory. The AOF rewrite also needs memory.
 - Watch `used_memory` and `maxmemory` in the metrics. Raise `VALKEY_MAXMEMORY` before `used_memory` is at 80 percent of it.
@@ -482,3 +485,24 @@ The release `v0.4.0` adds the audit service and the audit stream ACL. Do these s
 7. Examine the states with `docker compose ps`. The service `audit` shows `healthy`.
 
 The audit service adds one more service role in PostgreSQL. Each service role can use up to `SERVICE_DB_CONNECTION_LIMIT` (default 50) connections. Keep the number of services times this value lower than `POSTGRES_MAX_CONNECTIONS`. Increase `POSTGRES_MAX_CONNECTIONS` before you add a service if the total is not lower.
+
+## Upgrade from v0.4.x to v0.5.0
+
+The release `v0.5.0` adds the trusted set `audit.apps`, identity `0.9.0`, and audit `0.2.0`. Do these steps in this order:
+
+1. Make a backup of the databases and of the folder `secrets/`.
+2. Get the files of the release `v0.5.0`.
+3. Run `docker compose pull`.
+4. Run `docker compose run --rm provision-valkey`. This registers each service in `audit.apps` and gives the transition selectors. It also removes the names that are not in `CONSTELLATION_SERVICES` from `audit.apps`. If the script exits with a nonzero code, stop the upgrade. The step 4 can fail on `SADD` when the Valkey memory is full. Fix the cause and run step 4 again before step 5.
+5. Run `docker compose up -d`. This starts the audit image `0.2.0`.
+6. As the admin user, run these checks. `<reader>` is the user that `AUDIT_STREAM_READER` names (default `audit`).
+   - `SISMEMBER audit.apps <svc>` returns `1` for each name of `CONSTELLATION_SERVICES`.
+   - `ACL DRYRUN <reader> SSCAN audit.apps 0` returns `OK`.
+   - `ACL DRYRUN <reader> SREM audit.apps x` returns a text that has `no permissions`.
+   - `ACL DRYRUN <svc> SADD audit.apps x` returns a text that has `no permissions` for each producer.
+
+If step 5 comes before step 4, the audit service gets `NOPERM` on `SSCAN audit.apps` and counts `apps_error`. It finds no new producer. The table `known_apps` keeps the intake of the known apps. The fix is step 4.
+
+A later release deletes the `audit.streams` selectors. `DEL audit.streams` is then an optional manual step. Before that release, producers with the transition selectors write `audit.streams` again, so a delete has no lasting effect.
+
+Identity `0.9.0` limits the denied token entries. See "Audit stream retention" and "Valkey" for the buckets, the counter, and the new sizing rule.

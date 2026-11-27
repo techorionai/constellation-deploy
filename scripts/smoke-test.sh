@@ -137,6 +137,49 @@ expect_exact() {
   fi
 }
 
+# ACL DRYRUN as the admin user. An allowed command gives exactly OK. A refused command gives a
+# text that has "no permissions". The text is not an error reply. Arguments: user, then the command.
+acl_allowed() {
+  expect_exact OK vk_admin ACL DRYRUN "$@"
+}
+acl_refused() {
+  expect_output "no permissions" vk_admin ACL DRYRUN "$@"
+}
+
+# No user except the admin user (named default) can run SREM on an audit key. ACL DRYRUN uses the rules of the
+# user, with all selectors and all categories, so a category such as +@set or +@write also fails.
+no_srem_selector() {
+  local users user key
+  users="$(vk_admin ACL USERS 2>&1 | tr -d '\r')"
+  if [ -z "$users" ] || ! printf '%s
+' "$users" | grep -qx audit; then
+    echo "the list of ACL users has no user audit: $users"
+    return 1
+  fi
+  for user in $users; do
+    [ "$user" = "default" ] && continue
+    for key in audit.apps audit.streams; do
+      acl_refused "$user" SREM "$key" x || { echo "user $user can run SREM on $key"; return 1; }
+    done
+  done
+}
+
+# SISMEMBER audit.apps as the admin user. Arguments: name, expected reply (0 or 1).
+expect_registered() {
+  expect_exact "$2" vk_admin SISMEMBER audit.apps "$1"
+}
+
+# The checks of the audit.apps ACL for the reader and one producer. Arguments: reader, producer.
+check_audit_apps_acl() {
+  acl_allowed "$1" SSCAN audit.apps 0 || return 1
+  acl_refused "$1" SREM audit.apps x || return 1
+  acl_refused "$1" SADD audit.apps x || return 1
+  acl_refused "$2" SADD audit.apps x || return 1
+  acl_refused "$2" SSCAN audit.apps 0 || return 1
+  acl_refused "$2" SREM audit.apps x || return 1
+  no_srem_selector
+}
+
 expect_refused() {
   # Arguments: expected text, then the command. The command must fail.
   local want="$1" output
@@ -296,6 +339,7 @@ $(docker compose -p "$project" --env-file "$extra_env_file" run --rm --no-deps -
     return 1
   fi
   test_postgres_own smoke_c "$pw_db" || return 1
+  expect_registered smoke_c 1 || return 1
   test_valkey_own smoke_c "$pw_valkey"
 }
 
@@ -828,7 +872,16 @@ test_stream_events_user() {
   vk_admin SADD audit.streams smoke_a >/dev/null || return 1
   expect_exact OK vk audit "$pw" XGROUP CREATE events.stream:smoke_b smoke_audit_events_check 0 || return 1
   expect_output smoke_audit_events_check vk audit "$pw" XINFO GROUPS events.stream:smoke_b || return 1
+  # The old selector (~audit.streams +sscan) is for the transition.
   expect_output smoke_a vk audit "$pw" SSCAN audit.streams 0 || return 1
+  expect_output smoke_a vk audit "$pw" SSCAN audit.apps 0 || return 1
+  expect_output NOPERM vk audit "$pw" SREM audit.apps x || return 1
+  expect_output NOPERM vk audit "$pw" SREM audit.streams x || return 1
+  # The producer events cannot write or list the trusted set.
+  pw="$(envval EVENTS_VALKEY_PASSWORD)"
+  expect_output NOPERM vk events "$pw" SADD audit.apps x || return 1
+  expect_output NOPERM vk events "$pw" SSCAN audit.apps 0 || return 1
+  pw="$(envval AUDIT_VALKEY_PASSWORD)"
   expect_output NOPERM vk audit "$pw" XADD audit.stream:smoke_a '*' k v || return 1
   expect_output NOPERM vk audit "$pw" XADD events.stream:smoke_b '*' k v
 }
@@ -840,21 +893,61 @@ test_stream_after_restart() {
 }
 
 # I44: the selectors stay after a new provisioning run. Each user has exactly 4 selectors, and the
-# reader user audit has 6.
+# reader user audit has 7. The run registers the first list in audit.apps and deletes smoke_c.
 test_stream_after_reprovision() {
-  local count
-  test_reprovision || return 1
+  local count output name
+  output="$(dc run --rm --no-deps -T provision-valkey 2>&1)" || { printf '%s\n' "$output"; return 1; }
+  if ! printf '%s\n' "$output" | grep -qx "valkey: unregistered smoke_c"; then
+    echo "no 'valkey: unregistered smoke_c' in the output: $output"
+    return 1
+  fi
   test_stream_consume smoke_a.again || return 1
+  for name in smoke_a smoke_b identity events audit; do
+    expect_registered "$name" 1 || return 1
+  done
+  expect_registered smoke_c 0 || return 1
+  check_audit_apps_acl audit smoke_a || return 1
   count="$(vk_admin ACL LIST 2>&1 | tr -d '\r' | grep '^user smoke_a ' | grep -o '(~' | wc -l | tr -d ' ')"
   if [ "$count" != "4" ]; then
     echo "the user smoke_a has $count selectors, not 4"
     return 1
   fi
   count="$(selector_count audit)"
-  if [ "$count" != "6" ]; then
-    echo "the user audit has $count selectors, not 6"
+  if [ "$count" != "7" ]; then
+    echo "the user audit has $count selectors, not 7"
     return 1
   fi
+}
+
+# I60: two bad members in audit.apps, "Bad-name" and "*". The script does not delete them, does not
+# print them, and exits 0. The member "*" must not expand to file names in the shell of the script.
+test_audit_apps_bad_member() {
+  local output name warnings
+  vk_admin SADD audit.apps Bad-name '*' >/dev/null || return 1
+  output="$(dc run --rm --no-deps -T provision-valkey 2>&1)" || { printf '%s\n' "$output"; vk_admin SREM audit.apps Bad-name '*' >/dev/null; return 1; }
+  if [ "$(vk_admin SISMEMBER audit.apps Bad-name | tr -d '\r')" != "1" ]; then
+    echo "Bad-name was deleted"
+    vk_admin SREM audit.apps '*' >/dev/null
+    return 1
+  fi
+  if [ "$(vk_admin SISMEMBER audit.apps '*' | tr -d '\r')" != "1" ]; then
+    echo "the member * was deleted"
+    vk_admin SREM audit.apps Bad-name >/dev/null
+    return 1
+  fi
+  vk_admin SREM audit.apps Bad-name '*' >/dev/null || return 1
+  warnings="$(printf '%s\n' "$output" | grep -cF "WARNING: valkey: audit.apps has a bad name, not deleted" || true)"
+  if [ "$warnings" != "2" ]; then
+    echo "expected 2 warnings, got $warnings: $output"
+    return 1
+  fi
+  if printf '%s\n' "$output" | grep -qF -e "Bad-name" -e "unregistered"; then
+    echo "the output has a bad name or an unregistered line: $output"
+    return 1
+  fi
+  for name in smoke_a smoke_b identity events audit; do
+    expect_registered "$name" 1 || return 1
+  done
 }
 
 # I45: the database role and the Valkey user of the events service are isolated.
@@ -908,6 +1001,9 @@ test_audit_producer() {
     return 1
   fi
   expect_output NOPERM vk smoke_a "$pw" XADD audit.stream:smoke_b '*' k v || return 1
+  # The producer cannot write the trusted set audit.apps. provision-valkey registers the name.
+  expect_output NOPERM vk smoke_a "$pw" SADD audit.apps smoke_a || return 1
+  # SADD to audit.streams is the path of a producer before platform-go v0.9.0 (transition).
   # SADD gives 1 for a new member and 0 for a member that exists.
   out="$(vk smoke_a "$pw" SADD audit.streams smoke_a 2>&1 | tr -d '\r')"
   case "$out" in
@@ -922,7 +1018,8 @@ test_audit_no_reader() {
   pw="$(envval SMOKE_A_VALKEY_PASSWORD)"
   expect_output NOPERM vk smoke_a "$pw" XREADGROUP GROUP smoke_g c1 COUNT 1 STREAMS audit.stream:smoke_a '>' || return 1
   expect_output NOPERM vk smoke_a "$pw" XRANGE audit.stream:smoke_a - + || return 1
-  expect_output NOPERM vk smoke_a "$pw" SSCAN audit.streams 0
+  expect_output NOPERM vk smoke_a "$pw" SSCAN audit.streams 0 || return 1
+  expect_output NOPERM vk smoke_a "$pw" SSCAN audit.apps 0
 }
 
 # I52: the reader user reads audit streams and lists the set. It cannot write an audit stream.
@@ -931,6 +1028,7 @@ test_audit_reader() {
   pw="$(envval AUDIT_VALKEY_PASSWORD)"
   expect_exact OK vk audit "$pw" XGROUP CREATE audit.stream:smoke_a smoke_reader_check 0 || return 1
   expect_output smoke_reader_check vk audit "$pw" XINFO GROUPS audit.stream:smoke_a || return 1
+  expect_output smoke_a vk audit "$pw" SSCAN audit.apps 0 || return 1
   expect_output smoke_a vk audit "$pw" SSCAN audit.streams 0 || return 1
   # XREADGROUP needs +xreadgroup in the reader selector.
   expect_output audit.stream:smoke_a vk audit "$pw" XREADGROUP GROUP smoke_reader_check c1 COUNT 1 STREAMS audit.stream:smoke_a '>' || return 1
@@ -982,9 +1080,9 @@ selector_count() {
   vk_admin ACL LIST 2>&1 | tr -d '\r' | grep "^user $1 " | grep -o '(~' | wc -l | tr -d ' '
 }
 
-# The names of the Valkey users that have the selector (~audit.streams +sscan).
+# The names of the Valkey users that have the selector (~audit.apps +sscan).
 reader_selector_users() {
-  vk_admin ACL LIST 2>&1 | tr -d '\r' | grep -E '\(~audit\.streams [^)]*\+sscan\)' | awk '{ print $2 }'
+  vk_admin ACL LIST 2>&1 | tr -d '\r' | grep -E '\(~audit\.apps [^)]*\+sscan\)' | awk '{ print $2 }'
 }
 
 # I54: AUDIT_STREAM_READER=events in a second env file. After a provisioning run, the user events
@@ -996,25 +1094,140 @@ test_audit_reader_variable() {
     -e 's|^AUDIT_STREAM_READER=.*|AUDIT_STREAM_READER=events|' "$env_file" > "$extra_env_file"
   docker compose -p "$project" --env-file "$extra_env_file" run --rm --no-deps -T provision-valkey >/dev/null 2>&1 \
     || { echo "provision-valkey failed with the second env file"; result=1; }
-  if [ "$(selector_count events)" != "6" ] || [ "$(selector_count audit)" != "4" ]; then
-    echo "events has $(selector_count events) selectors and audit has $(selector_count audit), not 6 and 4"
+  if [ "$(selector_count events)" != "7" ] || [ "$(selector_count audit)" != "4" ]; then
+    echo "events has $(selector_count events) selectors and audit has $(selector_count audit), not 7 and 4"
     result=1
   fi
   if ! reader_selector_users | grep -qx events || reader_selector_users | grep -qx audit; then
-    echo "the selector (~audit.streams +sscan) is not only on the user events"
+    echo "the selector (~audit.apps +sscan) is not only on the user events"
     result=1
   fi
+  check_audit_apps_acl events audit || result=1
   rm -f "$extra_env_file"
   dc run --rm --no-deps -T provision-valkey >/dev/null 2>&1 || { echo "provision-valkey failed after the restore"; result=1; }
-  if [ "$(selector_count audit)" != "6" ] || [ "$(selector_count events)" != "4" ]; then
-    echo "the restore did not give 6 selectors to audit and 4 to events"
+  if [ "$(selector_count audit)" != "7" ] || [ "$(selector_count events)" != "4" ]; then
+    echo "the restore did not give 7 selectors to audit and 4 to events"
     result=1
   fi
   if ! reader_selector_users | grep -qx audit || reader_selector_users | grep -qx events; then
-    echo "the selector (~audit.streams +sscan) is not only on the user audit after the restore"
+    echo "the selector (~audit.apps +sscan) is not only on the user audit after the restore"
     result=1
   fi
+  check_audit_apps_acl audit events || result=1
   return "$result"
+}
+
+# The CloudEvent id of one denied token entry of I58. I59 reads it. The checks run in subshells,
+# so the id goes through a file in the key folder.
+denied_id_file() {
+  printf '%s/denied-event-id' "$key_dir"
+}
+
+# The shell text that sends one raw POST /oauth/token to identity. Argument: client ID.
+# The container postgres runs the text. The body goes in as an argument of printf.
+identity_token_script() {
+  local body
+  body="grant_type=client_credentials&client_id=$1&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion=a.b.c"
+  printf '%s' "(printf 'POST /oauth/token HTTP/1.0\r\nHost: identity:8080\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: ${#body}\r\n\r\n%s' '$body'; sleep 1) | nc -w 5 identity 8080"
+}
+
+# One raw POST /oauth/token to identity from the container postgres. Argument: client ID.
+# The output has the status line, the headers, and the body.
+identity_raw_token() {
+  dc exec -T postgres sh -c "$(identity_token_script "$1")" 2>&1 | tr -d '\r'
+}
+
+# N raw POST /oauth/token requests at the same time, from one shell in the container postgres.
+# They all arrive in a few seconds, so they are in one window of a rate limit bucket.
+# The output has one status line for each request. Arguments: client ID, N.
+identity_token_burst() {
+  dc exec -T postgres sh -c \
+    "i=0; while [ \$i -lt $2 ]; do ( $(identity_token_script "$1") | head -n 1 ) & i=\$((i + 1)); done; wait" \
+    2>&1 | tr -d '\r'
+}
+
+# The entries of audit.stream:identity after an ID, as admin. The ID is exclusive.
+identity_entries_after() {
+  vk_admin XRANGE audit.stream:identity "($1" + 2>&1 | tr -d '\r'
+}
+
+# The denied token entries of unknown clients in the output of identity_entries_after.
+count_unknown_client_denied() {
+  grep -E '"grant": *"client_credentials"' | grep -E '"reason": *"invalid_client"' | grep -vcF '"clientId"' || true
+}
+
+# I58: identity 0.9.0 limits the denied token entries. 40 requests in a short burst with one unknown client ID
+# come from one IP (the container postgres), so the bucket token_denied (30 in 1 minute) applies.
+# Identity writes no clientId for an unknown client, so the check filters by grant and reason.
+test_identity_denied_limit() {
+  local last cid out code count end
+  last="$(vk_admin XREVRANGE audit.stream:identity + - COUNT 1 2>&1 | tr -d '\r' | head -n 1)"
+  case "$last" in
+    [0-9]*-[0-9]*) ;;
+    *) last="0-0" ;;
+  esac
+  cid="smoke-unknown-$(openssl rand -hex 8)"
+  # One full request, then a burst of 39 requests. The 40 requests are in one 1 minute window.
+  out="$(identity_raw_token "$cid")"
+  code="$(http_code "$out")"
+  if [ "$code" != "401" ] || ! printf '%s
+' "$out" | grep -qF 'invalid_client'; then
+    echo "request 1 got status $code: $(printf "%s" "$out" | tail -n 3)"
+    return 1
+  fi
+  out="$(identity_token_burst "$cid" 39)"
+  count="$(printf '%s
+' "$out" | grep -cE '^HTTP/[0-9.]+ 401' || true)"
+  if [ "$count" != "39" ]; then
+    echo "$count of 39 burst requests got status 401: $(printf '%s
+' "$out" | sort | uniq -c | head -n 5)"
+    return 1
+  fi
+  end=$((SECONDS + 30))
+  while :; do
+    count="$(identity_entries_after "$last" | count_unknown_client_denied)"
+    [ "$count" -ge 30 ] && break
+    if [ "$SECONDS" -ge "$end" ]; then
+      echo "only $count denied entries in 30 seconds, expected 30"
+      echo "last id: $last, entries after: $(identity_entries_after "$last" | grep -c '^[0-9]*-[0-9]*$')"
+      identity_entries_after "$last" | head -n 3 | cut -c1-400
+      dc logs --tail 5 identity
+      return 1
+    fi
+    sleep 2
+  done
+  sleep 5
+  count="$(identity_entries_after "$last" | count_unknown_client_denied)"
+  if [ "$count" != "30" ]; then
+    echo "$count denied entries after the wait, expected 30"
+    return 1
+  fi
+  identity_entries_after "$last" | grep -E '"grant": *"client_credentials"' | grep -E '"reason": *"invalid_client"' | grep -vF '"clientId"' | head -n 1 \
+    | grep -oE '"id": *"[0-9a-f-]{36}"' | head -n 1 | cut -d'"' -f4 > "$(denied_id_file)"
+  if [ ! -s "$(denied_id_file)" ]; then
+    echo "no CloudEvent id in the denied entries"
+    return 1
+  fi
+}
+
+# I59: the denied entry of I58 is in audit_entries with service identity. The audit service finds
+# identity through audit.apps, so this also shows the registration.
+test_identity_entry_in_audit() {
+  local id apass rows end
+  id="$(cat "$(denied_id_file)" 2>/dev/null)"
+  [ -n "$id" ] || { echo "no entry id from I58"; return 1; }
+  apass="$(envval AUDIT_DB_PASSWORD)"
+  end=$((SECONDS + 90))
+  while :; do
+    rows="$(pg audit "$apass" audit -c "SELECT count(*) FROM audit_entries WHERE service = 'identity' AND entry_id = '$id'" | tr -d '\r')"
+    [ "$rows" = "1" ] && break
+    if [ "$SECONDS" -ge "$end" ]; then
+      echo "no row in audit_entries in 90 seconds for $id"
+      dc logs --tail 20 audit
+      return 1
+    fi
+    sleep 3
+  done
 }
 
 # I55: the database role and the Valkey user of the audit service are isolated.
@@ -1166,6 +1379,7 @@ run_check "I42: the user events has the same selectors" test_stream_events_user
 run_check "I45: events database and Valkey isolation" test_events_isolation
 run_check "I43: stream selectors after a Valkey restart" test_stream_after_restart
 run_check "I44: stream selectors after a provisioning run" test_stream_after_reprovision
+run_check "I60: bad member in audit.apps" test_audit_apps_bad_member
 run_check "I47: identity with a missing clients file" test_identity_missing_clients_file
 run_check "I39: events with a wrong key ID" test_events_wrong_key_id
 run_check "I46: no secret in the events log" test_events_no_secret_in_logs
@@ -1174,6 +1388,8 @@ run_check "I50: audit producer selectors" test_audit_producer
 run_check "I51: no audit read for a producer" test_audit_no_reader
 run_check "I52: audit reader selectors" test_audit_reader
 run_check "I53: audit entry from a service to the audit database" test_audit_end_to_end
+run_check "I58: identity limits denied token entries" test_identity_denied_limit
+run_check "I59: identity entry in the audit database" test_identity_entry_in_audit
 run_check "I55: audit database and Valkey isolation" test_audit_isolation
 run_check "I56: no secret in the audit log, password encoding" test_audit_no_secret_in_logs
 run_check "I57: audit API refuses a request with no token" test_audit_no_token
