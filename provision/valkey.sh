@@ -35,13 +35,32 @@ check_list() {
   done
 }
 
+# The reader of the audit streams is the one user that AUDIT_STREAM_READER names. An unset or
+# empty value gives "audit". The name must pass the name rule and be in the service list.
+# An empty service list has no reader.
+check_reader() {
+  [ -n "$1" ] || return 0
+  reader="${AUDIT_STREAM_READER:-audit}"
+  if ! check_name "$reader"; then
+    echo "ERROR: AUDIT_STREAM_READER has a bad service name: $reader" >&2
+    return 1
+  fi
+  case ",$1," in
+    *",$reader,"*) return 0 ;;
+  esac
+  echo "ERROR: AUDIT_STREAM_READER names $reader, which is not in the service list" >&2
+  return 1
+}
+
 if [ "${1:-}" = "--check-names" ]; then
-  check_list "${2:-}"
+  check_list "${2:-}" && check_reader "${2:-}"
   exit $?
 fi
 
 services="${CONSTELLATION_SERVICES:-}"
 check_list "$services" || exit 1
+check_reader "$services" || exit 1
+audit_reader="${AUDIT_STREAM_READER:-audit}"
 
 # Examine each password before the script changes anything.
 check_password VALKEY_ADMIN_PASSWORD "${VALKEY_ADMIN_PASSWORD:-}" || exit 1
@@ -80,13 +99,22 @@ expect_ok() {
 # A service name cannot have a ".", so no root pattern "~<svc>:*" matches a stream key.
 # The first selector lets the service write and trim only its own stream. The second selector
 # lets the service read, ack, and claim on every stream. The ACL cannot isolate consumer groups.
+#
+# Each user also gets two selectors to write audit entries. They are the same as
+# AuditProducerSelectors(app) of platform-go v0.7.0. The user that AUDIT_STREAM_READER names
+# also gets the two selectors of AuditReaderSelectors(). Only this user reads audit streams.
+# The reader lists the set "audit.streams" with SSCAN, not SMEMBERS.
 # Each selector is in quotes, because valkey-cli splits the rule at spaces.
 provision() {
   svc="$1"
   upper=$(printf '%s' "$svc" | tr '[:lower:]' '[:upper:]')
   pw=$(printenv "${upper}_VALKEY_PASSWORD" || true)
   hash=$(printf '%s' "$pw" | sha256sum | cut -d' ' -f1)
-  reply=$(cli "ACL SETUSER $svc reset on #$hash ~$svc:* +@all -@admin -@dangerous -@scripting -function -scan -randomkey -dbsize -memory \"(~events.stream:$svc +xadd +xtrim)\" \"(~events.stream:* +xreadgroup +xack +xautoclaim +xpending +xinfo|groups +xinfo|stream +xinfo|consumers +xgroup|create +xgroup|createconsumer +xgroup|delconsumer +xrange)\"")
+  audit_sel="\"(~audit.stream:$svc +xadd +xtrim)\" \"(~audit.streams +sadd)\""
+  if [ "$svc" = "$audit_reader" ]; then
+    audit_sel="$audit_sel \"(~audit.stream:* +xreadgroup +xack +xautoclaim +xpending +xinfo|groups +xinfo|stream +xinfo|consumers +xgroup|create +xgroup|createconsumer +xgroup|delconsumer +xrange)\" \"(~audit.streams +sscan)\""
+  fi
+  reply=$(cli "ACL SETUSER $svc reset on #$hash ~$svc:* +@all -@admin -@dangerous -@scripting -function -scan -randomkey -dbsize -memory \"(~events.stream:$svc +xadd +xtrim)\" \"(~events.stream:* +xreadgroup +xack +xautoclaim +xpending +xinfo|groups +xinfo|stream +xinfo|consumers +xgroup|create +xgroup|createconsumer +xgroup|delconsumer +xrange)\" $audit_sel")
   expect_ok "$reply"
   echo "valkey: provisioned $svc"
 }
