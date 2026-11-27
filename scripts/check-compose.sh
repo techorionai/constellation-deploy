@@ -187,6 +187,19 @@ done < <(find "$folder" -name '*.sh' -not -path '*/.git/*' -print0)
   check_no_whitespace TEST_PASSWORD "no-space-here" 2>/dev/null || exit 1
 ) || fail password-rules "provision/check-password.sh"
 
+# 9. Identity and events set the retention of the audit stream. Without it, the image default of
+# 168h applies and failed token requests can fill the Valkey memory. The check applies only
+# if the Compose file runs the identity image or the events image.
+if [ -f "$compose_file" ]; then
+  for pair in "constellation-identity:IDENTITY_RETENTION__AUDIT_STREAM__PERIOD" "constellation-events:EVENTS_RETENTION__AUDIT_STREAM__PERIOD"; do
+    img="${pair%%:*}"
+    var="${pair#*:}"
+    if grep -qE "image:.*/$img:" "$compose_file" && ! grep -qE "^[[:space:]]+$var:[[:space:]]*[^[:space:]]" "$compose_file"; then
+      fail audit-retention "$var"
+    fi
+  done
+fi
+
 if [ "$failed" -ne 0 ]; then
   exit 1
 fi

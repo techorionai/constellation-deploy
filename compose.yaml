@@ -211,7 +211,7 @@ services:
 
   identity:
     <<: *hardened
-    image: ghcr.io/techorionai/constellation-identity:0.7.1
+    image: ghcr.io/techorionai/constellation-identity:0.8.0
     restart: unless-stopped
     read_only: true
     depends_on:
@@ -242,6 +242,8 @@ services:
       IDENTITY_IDP__MICROSOFT__TENANT: ${IDENTITY_MICROSOFT_TENANT:-organizations}
       # The name that the browser shows when a user registers a passkey.
       IDENTITY_WEBAUTHN__RP_NAME: ${IDENTITY_WEBAUTHN_RP_NAME:-Constellation}
+      # Age limit of the audit stream. A longer period than the longest stop of the audit service. See docs/compose.md.
+      IDENTITY_RETENTION__AUDIT_STREAM__PERIOD: ${AUDIT_STREAM_RETENTION:-24h}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
     secrets:
       - identity_master_key
@@ -267,7 +269,7 @@ services:
 
   events:
     <<: *hardened
-    image: ghcr.io/techorionai/constellation-events:0.1.0
+    image: ghcr.io/techorionai/constellation-events:0.2.0
     restart: unless-stopped
     read_only: true
     depends_on:
@@ -300,6 +302,8 @@ services:
       EVENTS_AUTH__ISSUER: ${IDENTITY_ISSUER:?Set IDENTITY_ISSUER in the env file}
       EVENTS_AUTH__JWKS_URL: http://identity:8080/.well-known/jwks.json
       EVENTS_AUTH__ALLOW_INSECURE_HTTP: "true"
+      # Age limit of the audit stream. A longer period than the longest stop of the audit service. See docs/compose.md.
+      EVENTS_RETENTION__AUDIT_STREAM__PERIOD: ${AUDIT_STREAM_RETENTION:-24h}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
     secrets:
       - events_client_key
