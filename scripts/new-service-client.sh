@@ -63,7 +63,7 @@ case "$svc" in
   *,*) die "bad service name: $svc" ;;
   identity) die "the name identity is not allowed for a service client" ;;
 esac
-sh "$repo_root/provision/valkey.sh" --check-names "$svc" 2>/dev/null || die "bad service name: $svc"
+sh "$repo_root/provision/postgres.sh" --check-names "$svc" 2>/dev/null || die "bad service name: $svc"
 [ -n "$kid" ] || kid="$svc-1"
 [[ "$kid" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || die "bad key ID: $kid"
 for role in "${roles[@]+"${roles[@]}"}"; do
