@@ -196,7 +196,7 @@ test_up() {
 check_states() {
   local states service state health code
   states="$(dc ps -a --format '{{.Service}} {{.State}} {{.Health}} {{.ExitCode}}')"
-  for service in postgres valkey prometheus grafana identity events; do
+  for service in postgres valkey prometheus grafana identity events audit; do
     health="$(printf '%s\n' "$states" | awk -v s="$service" '$1 == s { print $3 }')"
     if [ "$health" != "healthy" ]; then
       echo "$service is not healthy: $health"
@@ -278,7 +278,7 @@ test_valkey_not_root() {
 test_new_service() {
   local pw_db="smoke-c-db-pw" pw_valkey="smoke-c-valkey-pw"
   sed -e "s|^CONSTELLATION_ENV_FILE=.*|CONSTELLATION_ENV_FILE=$extra_env_file|" \
-    -e 's|^CONSTELLATION_SERVICES=.*|CONSTELLATION_SERVICES=smoke_a,smoke_b,smoke_c|' \
+    -e 's|^CONSTELLATION_SERVICES=.*|CONSTELLATION_SERVICES=smoke_a,smoke_b,identity,events,audit,smoke_c|' \
     "$env_file" > "$extra_env_file"
   {
     echo "SMOKE_C_DB_PASSWORD=$pw_db"
@@ -421,7 +421,7 @@ test_no_password_in_logs() {
 }
 
 # Make the keys in a temporary folder with the procedures of docs/compose.md: the master key of
-# identity, and the client key and the clients file of the events service (scripts/new-service-client.sh).
+# identity, and the client keys and the clients file of the events and audit services (scripts/new-service-client.sh).
 # The folder has mode 0700 and each key file has mode 0444, so the container user can read it.
 # The script exports the paths. A shell variable overrides the env file.
 make_keys() {
@@ -431,6 +431,9 @@ make_keys() {
   chmod 0444 "$key_dir/identity-master-key"
   bash scripts/new-service-client.sh --secrets-dir "$key_dir" --clients-file "$key_dir/identity-clients.yaml" \
     events >/dev/null || return 1
+  bash scripts/new-service-client.sh --secrets-dir "$key_dir" --clients-file "$key_dir/identity-clients.yaml" \
+    audit >/dev/null || return 1
+  chmod 0444 "$key_dir/audit-client-key.pem"
   chmod 0444 "$key_dir/events-client-key.pem"
   # Docker on Windows needs a Windows path. Git Bash gives one with cygpath.
   local host_dir="$key_dir"
@@ -439,8 +442,9 @@ make_keys() {
   fi
   IDENTITY_MASTER_KEY_FILE="$host_dir/identity-master-key"
   EVENTS_CLIENT_KEY_FILE="$host_dir/events-client-key.pem"
+  AUDIT_CLIENT_KEY_FILE="$host_dir/audit-client-key.pem"
   IDENTITY_CLIENTS_PATH="$host_dir/identity-clients.yaml"
-  export IDENTITY_MASTER_KEY_FILE EVENTS_CLIENT_KEY_FILE IDENTITY_CLIENTS_PATH
+  export IDENTITY_MASTER_KEY_FILE EVENTS_CLIENT_KEY_FILE AUDIT_CLIENT_KEY_FILE IDENTITY_CLIENTS_PATH
 }
 
 # Read a URL from the container postgres. It is in the network "services", like a business service.
@@ -817,14 +821,20 @@ test_stream_after_restart() {
   test_stream_write_own
 }
 
-# I44: the selectors stay after a new provisioning run. The user has exactly two selectors.
+# I44: the selectors stay after a new provisioning run. Each user has exactly 4 selectors, and the
+# reader user audit has 6.
 test_stream_after_reprovision() {
   local count
   test_reprovision || return 1
   test_stream_consume smoke_a.again || return 1
   count="$(vk_admin ACL LIST 2>&1 | tr -d '\r' | grep '^user smoke_a ' | grep -o '(~' | wc -l | tr -d ' ')"
-  if [ "$count" != "2" ]; then
-    echo "the user smoke_a has $count selectors, not 2"
+  if [ "$count" != "4" ]; then
+    echo "the user smoke_a has $count selectors, not 4"
+    return 1
+  fi
+  count="$(selector_count audit)"
+  if [ "$count" != "6" ]; then
+    echo "the user audit has $count selectors, not 6"
     return 1
   fi
 }
@@ -851,6 +861,161 @@ test_events_no_secret_in_logs() {
   done
   if printf '%s' "$logs" | grep -qF -e 'PRIVATE KEY' -e "$key_body" -e 'eyJ'; then
     echo "the events log has a private key or a token"
+    return 1
+  fi
+}
+
+# Wait until the audit service is healthy.
+audit_healthy() {
+  [ "$(dc ps --format '{{.Service}} {{.Health}}' | awk '$1 == "audit" { print $2 }')" = "healthy" ]
+}
+
+# I49: the audit service is healthy and its readiness endpoint gives 200. It is ready only after
+# identity accepted its client assertion and its manifest.
+test_audit_healthy() {
+  audit_healthy || { echo "audit is not healthy"; dc logs --tail 20 audit; return 1; }
+  svc_get http://audit:9090/readyz >/dev/null
+}
+
+# I50: a service writes its own audit stream and adds its own name to the set. It cannot write
+# the audit stream of another app.
+test_audit_producer() {
+  local pw out
+  pw="$(envval SMOKE_A_VALKEY_PASSWORD)"
+  out="$(vk smoke_a "$pw" XADD audit.stream:smoke_a '*' k v 2>&1)"
+  if ! printf '%s\n' "$out" | has_entry_id; then
+    echo "XADD to the own audit stream gave: $out"
+    return 1
+  fi
+  expect_output NOPERM vk smoke_a "$pw" XADD audit.stream:smoke_b '*' k v || return 1
+  # SADD gives 1 for a new member and 0 for a member that exists.
+  out="$(vk smoke_a "$pw" SADD audit.streams smoke_a 2>&1 | tr -d '\r')"
+  case "$out" in
+    0 | 1) ;;
+    *) echo "SADD to audit.streams gave: $out"; return 1 ;;
+  esac
+}
+
+# I51: a service that is not the reader cannot read audit streams or list the set.
+test_audit_no_reader() {
+  local pw
+  pw="$(envval SMOKE_A_VALKEY_PASSWORD)"
+  expect_output NOPERM vk smoke_a "$pw" XREADGROUP GROUP smoke_g c1 COUNT 1 STREAMS audit.stream:smoke_a '>' || return 1
+  expect_output NOPERM vk smoke_a "$pw" XRANGE audit.stream:smoke_a - + || return 1
+  expect_output NOPERM vk smoke_a "$pw" SSCAN audit.streams 0
+}
+
+# I52: the reader user reads audit streams and lists the set. It cannot write an audit stream.
+test_audit_reader() {
+  local pw
+  pw="$(envval AUDIT_VALKEY_PASSWORD)"
+  expect_exact OK vk audit "$pw" XGROUP CREATE audit.stream:smoke_a smoke_reader_check 0 || return 1
+  expect_output smoke_reader_check vk audit "$pw" XINFO GROUPS audit.stream:smoke_a || return 1
+  expect_output smoke_a vk audit "$pw" SSCAN audit.streams 0 || return 1
+  expect_output NOPERM vk audit "$pw" XADD audit.stream:smoke_a '*' k v
+}
+
+# A lowercase UUID in the text form.
+new_uuid() {
+  local h
+  h="$(openssl rand -hex 16)"
+  printf '%s-%s-4%s-a%s-%s' "${h:0:8}" "${h:8:4}" "${h:13:3}" "${h:17:3}" "${h:20:12}"
+}
+
+# I53: end to end. A service writes an audit entry in its stream. The audit service reads it and
+# stores it. The table rejected_entries has no row.
+test_audit_end_to_end() {
+  local pw id now event rows rejected apass end out
+  pw="$(envval SMOKE_A_VALKEY_PASSWORD)"
+  apass="$(envval AUDIT_DB_PASSWORD)"
+  id="$(new_uuid)"
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  event="{\"specversion\":\"1.0\",\"id\":\"$id\",\"source\":\"/smoke_a\",\"type\":\"smoke_a.audit.recorded\",\"time\":\"$now\",\"datacontenttype\":\"application/json\",\"actor\":\"smoke_a\",\"actortype\":\"service\",\"data\":{\"action\":\"smoke_a:item:update\",\"result\":\"success\"}}"
+  out="$(vk smoke_a "$pw" XADD audit.stream:smoke_a '*' event "$event" 2>&1)"
+  if ! printf '%s\n' "$out" | has_entry_id; then
+    echo "XADD gave: $out"
+    return 1
+  fi
+  vk smoke_a "$pw" SADD audit.streams smoke_a >/dev/null || return 1
+  end=$((SECONDS + 90))
+  while :; do
+    rows="$(pg audit "$apass" audit -c "SELECT count(*) FROM audit_entries WHERE service = 'smoke_a' AND entry_id = '$id'" | tr -d '\r')"
+    [ "$rows" = "1" ] && break
+    if [ "$SECONDS" -ge "$end" ]; then
+      echo "no row in audit_entries in 90 seconds for $id"
+      dc logs --tail 20 audit
+      return 1
+    fi
+    sleep 3
+  done
+  rejected="$(pg audit "$apass" audit -c "SELECT count(*) FROM rejected_entries" | tr -d '\r')"
+  if [ "$rejected" != "0" ]; then
+    echo "rejected_entries has $rejected rows"
+    return 1
+  fi
+}
+
+# Count the selectors of a Valkey user.
+selector_count() {
+  vk_admin ACL LIST 2>&1 | tr -d '\r' | grep "^user $1 " | grep -o '(~' | wc -l | tr -d ' '
+}
+
+# I54: AUDIT_STREAM_READER=events in a second env file. After a provisioning run, the user events
+# has the reader selectors and the user audit has not. After the check, the first env file
+# is used again.
+test_audit_reader_variable() {
+  local result=0
+  sed -e "s|^CONSTELLATION_ENV_FILE=.*|CONSTELLATION_ENV_FILE=$extra_env_file|" \
+    -e 's|^AUDIT_STREAM_READER=.*|AUDIT_STREAM_READER=events|' "$env_file" > "$extra_env_file"
+  docker compose -p "$project" --env-file "$extra_env_file" run --rm --no-deps -T provision-valkey >/dev/null 2>&1 \
+    || { echo "provision-valkey failed with the second env file"; result=1; }
+  if [ "$(selector_count events)" != "6" ] || [ "$(selector_count audit)" != "4" ]; then
+    echo "events has $(selector_count events) selectors and audit has $(selector_count audit), not 6 and 4"
+    result=1
+  fi
+  rm -f "$extra_env_file"
+  dc run --rm --no-deps -T provision-valkey >/dev/null 2>&1 || { echo "provision-valkey failed after the restore"; result=1; }
+  if [ "$(selector_count audit)" != "6" ] || [ "$(selector_count events)" != "4" ]; then
+    echo "the restore did not give 6 selectors to audit and 4 to events"
+    result=1
+  fi
+  return "$result"
+}
+
+# I55: the database role and the Valkey user of the audit service are isolated.
+test_audit_isolation() {
+  local pw
+  pw="$(envval AUDIT_VALKEY_PASSWORD)"
+  expect_refused CONNECT pg audit "$(envval AUDIT_DB_PASSWORD)" events -c 'SELECT 1' || return 1
+  expect_output NOPERM vk audit "$pw" GET events:k || return 1
+  expect_exact OK vk audit "$pw" SET audit:smoke 1
+}
+
+# I56: the log of the audit service has no password, no private key, and no token. The service
+# connects with a database password that has the characters + / =.
+test_audit_no_secret_in_logs() {
+  local logs key_body name
+  check_password_encoding AUDIT || return 1
+  logs="$(dc logs audit 2>&1)" || return 1
+  key_body="$(sed -n 2p "$key_dir/audit-client-key.pem")"
+  for name in AUDIT_DB_PASSWORD AUDIT_VALKEY_PASSWORD; do
+    if printf '%s' "$logs" | grep -qF -- "$(envval "$name")"; then
+      echo "the audit log has the value of $name"
+      return 1
+    fi
+  done
+  if printf '%s' "$logs" | grep -qF -e 'PRIVATE KEY' -e "$key_body" -e 'eyJ'; then
+    echo "the audit log has a private key or a token"
+    return 1
+  fi
+}
+
+# I57: the API of the audit service refuses a request with no token.
+test_audit_no_token() {
+  local code
+  code="$(dc exec -T postgres wget -q -T 10 -S -O /dev/null http://audit:8080/v1/audit-entries 2>&1 | grep -oE 'HTTP/[0-9.]+ [0-9]+' | tail -n 1 | cut -d' ' -f2)"
+  if [ "$code" != "401" ]; then
+    echo "expected 401, got: $code"
     return 1
   fi
 }
@@ -891,7 +1056,7 @@ test_identity_missing_clients_file() {
   fi
 }
 
-make_keys || { echo "FAIL: the keys of identity and events"; exit 1; }
+make_keys || { echo "FAIL: the keys of identity, events, and audit"; exit 1; }
 
 # Remove a project of an earlier run.
 dc down -v --remove-orphans >/dev/null 2>&1
@@ -969,6 +1134,15 @@ run_check "I44: stream selectors after a provisioning run" test_stream_after_rep
 run_check "I47: identity with a missing clients file" test_identity_missing_clients_file
 run_check "I39: events with a wrong key ID" test_events_wrong_key_id
 run_check "I46: no secret in the events log" test_events_no_secret_in_logs
+run_check "I49: audit is healthy and ready" test_audit_healthy
+run_check "I50: audit producer selectors" test_audit_producer
+run_check "I51: no audit read for a producer" test_audit_no_reader
+run_check "I52: audit reader selectors" test_audit_reader
+run_check "I53: audit entry from a service to the audit database" test_audit_end_to_end
+run_check "I55: audit database and Valkey isolation" test_audit_isolation
+run_check "I56: no secret in the audit log, password encoding" test_audit_no_secret_in_logs
+run_check "I57: audit API refuses a request with no token" test_audit_no_token
+run_check "I54: AUDIT_STREAM_READER names another user" test_audit_reader_variable
 
 if [ "${#failures[@]}" -ne 0 ]; then
   echo "smoke-test: ${#failures[@]} check(s) failed: ${failures[*]}"
