@@ -100,7 +100,7 @@ Limit: Loki, Tempo, Prometheus, and the collector have no authentication. A plat
 
 ## Identity
 
-The service `identity` is the identity provider of the platform. It uses the image `ghcr.io/techorionai/constellation-identity:0.7.1`. It uses the database `identity` and the Valkey user `identity` that the provisioning services make from the name `identity` in `CONSTELLATION_SERVICES`.
+The service `identity` is the identity provider of the platform. It uses the image `ghcr.io/techorionai/constellation-identity:0.8.0`. It uses the database `identity` and the Valkey user `identity` that the provisioning services make from the name `identity` in `CONSTELLATION_SERVICES`.
 
 ### Master key
 
@@ -216,7 +216,7 @@ The command prints the link and deletes the earlier unused links. Run it again t
 
 ## Events service
 
-The service `events` is the events service of the platform. It uses the image `ghcr.io/techorionai/constellation-events:0.1.0`, the database `events`, and the Valkey user `events`. It has no published port. Only services on the network `services` call it. Its admin port `9090` is not published.
+The service `events` is the events service of the platform. It uses the image `ghcr.io/techorionai/constellation-events:0.2.0`, the database `events`, and the Valkey user `events`. It has no published port. Only services on the network `services` call it. Its admin port `9090` is not published.
 
 - The events service is the first service client in Compose. It gets tokens from identity with a client key (see "Service clients"). It reads the private key as the Compose secret `events_client_key` from the file `EVENTS_CLIENT_KEY_FILE`.
 - It starts after identity is healthy. It is ready only after it publishes its manifest to identity with a client credentials token. If `readyz` does not give 200, examine `EVENTS_CLIENT_KEY_ID` and the clients file first.
