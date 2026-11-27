@@ -105,8 +105,8 @@ fi
 
 # 5. Each password, secret, token, and key in .env.example is a placeholder.
 # The variable name has the word PASSWORD, SECRET, TOKEN, or KEY between underscores.
-# Four exact names hold no secret: IDENTITY_MASTER_KEY_FILE and EVENTS_CLIENT_KEY_FILE (paths),
-# IDENTITY_MASTER_KEY_ID and EVENTS_CLIENT_KEY_ID
+# Six exact names hold no secret: IDENTITY_MASTER_KEY_FILE, EVENTS_CLIENT_KEY_FILE, and AUDIT_CLIENT_KEY_FILE (paths),
+# IDENTITY_MASTER_KEY_ID, EVENTS_CLIENT_KEY_ID, and AUDIT_CLIENT_KEY_ID
 # (identifiers). They can have any value. No other name is exempt.
 secret_re='^([A-Za-z0-9_]*_)?(PASSWORD|SECRET|TOKEN|KEY)(_[A-Za-z0-9_]*)?='
 if [ -f "$example_file" ]; then
@@ -114,7 +114,7 @@ if [ -f "$example_file" ]; then
     name="${line%%=*}"
     value="${line#*=}"
     case "$name" in
-      IDENTITY_MASTER_KEY_FILE | IDENTITY_MASTER_KEY_ID | EVENTS_CLIENT_KEY_FILE | EVENTS_CLIENT_KEY_ID) continue ;;
+      IDENTITY_MASTER_KEY_FILE | IDENTITY_MASTER_KEY_ID | EVENTS_CLIENT_KEY_FILE | EVENTS_CLIENT_KEY_ID | AUDIT_CLIENT_KEY_FILE | AUDIT_CLIENT_KEY_ID) continue ;;
     esac
     if [ "$value" != "change-me" ]; then
       fail example-secret "$name"
@@ -132,10 +132,39 @@ for script in postgres valkey; do
       fail provision-names "$script.sh accepts $name"
     fi
   done
-  if ! sh "$path" --check-names 'identity,audit_log' >/dev/null 2>&1; then
-    fail provision-names "$script.sh rejects identity,audit_log"
+  if ! sh "$path" --check-names 'identity,audit,audit_log' >/dev/null 2>&1; then
+    fail provision-names "$script.sh rejects identity,audit,audit_log"
   fi
 done
+
+# U1: the reader of the audit streams. AUDIT_STREAM_READER must be in the service list and pass
+# the name rule. The check runs with no server.
+reader_check() {
+  # $1 = value of AUDIT_STREAM_READER, or "unset". $2 = service list. $3 = expected exit code.
+  local code
+  if [ "$1" = "unset" ]; then
+    env -u AUDIT_STREAM_READER sh "$repo_root/provision/valkey.sh" --check-names "$2" >/dev/null 2>&1
+  else
+    AUDIT_STREAM_READER="$1" sh "$repo_root/provision/valkey.sh" --check-names "$2" >/dev/null 2>&1
+  fi
+  code=$?
+  if [ "$code" -ne "$3" ]; then
+    fail provision-reader "AUDIT_STREAM_READER=$1 with $2 gave exit code $code"
+  fi
+}
+reader_check unset identity,events,audit 0
+reader_check '' identity,events,audit 0
+reader_check crm identity,events,audit 1
+reader_check Bad identity,events,audit 1
+reader_check unset identity,events 1
+for reader_value in crm Bad; do
+  if ! AUDIT_STREAM_READER="$reader_value" sh "$repo_root/provision/valkey.sh" --check-names identity,events,audit 2>&1 | grep -q AUDIT_STREAM_READER; then
+    fail provision-reader "the message for AUDIT_STREAM_READER=$reader_value does not name AUDIT_STREAM_READER"
+  fi
+done
+if ! env -u AUDIT_STREAM_READER sh "$repo_root/provision/valkey.sh" --check-names identity,events 2>&1 | grep -q AUDIT_STREAM_READER; then
+  fail provision-reader "the message for a reader that is not in the list does not name AUDIT_STREAM_READER"
+fi
 
 # 7. No shell file has a CR character.
 while IFS= read -r -d '' file; do

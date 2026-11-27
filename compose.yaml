@@ -314,19 +314,74 @@ services:
     networks:
       - services
 
+  audit:
+    <<: *hardened
+    image: ghcr.io/techorionai/constellation-audit:0.1.0
+    restart: unless-stopped
+    read_only: true
+    depends_on:
+      provision-postgres:
+        condition: service_completed_successfully
+      provision-valkey:
+        condition: service_completed_successfully
+      otel-collector:
+        condition: service_started
+      identity:
+        condition: service_healthy
+    environment:
+      AUDIT_DATABASE__URL: postgres://audit:${AUDIT_DB_PASSWORD_URLENCODED:?Set AUDIT_DB_PASSWORD_URLENCODED}@postgres:5432/audit?sslmode=disable
+      AUDIT_DATABASE__NAME: audit
+      # The pool rule is MaxConns >= 4 + 2 x AUDIT_EXPORT__CONCURRENCY. The default
+      # concurrency is 2, so 8 is the minimum (see docs/compose.md).
+      AUDIT_DATABASE__MAX_CONNS: "8"
+      AUDIT_VALKEY__ADDRESS: valkey:6379
+      AUDIT_VALKEY__USERNAME: audit
+      AUDIT_VALKEY__PASSWORD: ${AUDIT_VALKEY_PASSWORD:?Set AUDIT_VALKEY_PASSWORD in the env file}
+      AUDIT_VALKEY__KEY_PREFIX: audit
+      # The service client of the audit service. The private key is the Compose secret
+      # audit_client_key. The key ID and the key path are not secrets.
+      AUDIT_CLIENT__ID: audit
+      AUDIT_CLIENT__KEY_ID: ${AUDIT_CLIENT_KEY_ID:?Set AUDIT_CLIENT_KEY_ID in the env file}
+      AUDIT_CLIENT__PRIVATE_KEY_FILE: /run/secrets/audit_client_key
+      AUDIT_CLIENT__ISSUER: ${IDENTITY_ISSUER:?Set IDENTITY_ISSUER in the env file}
+      AUDIT_CLIENT__TOKEN_URL: http://identity:8080/oauth/token
+      # The services talk to identity on the internal network with HTTP.
+      AUDIT_CLIENT__ALLOW_INSECURE_HTTP: "true"
+      AUDIT_IDENTITY__URL: http://identity:8080
+      AUDIT_IDENTITY__ALLOW_INSECURE_HTTP: "true"
+      AUDIT_AUTH__ISSUER: ${IDENTITY_ISSUER:?Set IDENTITY_ISSUER in the env file}
+      AUDIT_AUTH__JWKS_URL: http://identity:8080/.well-known/jwks.json
+      AUDIT_AUTH__ALLOW_INSECURE_HTTP: "true"
+      # AUDIT_HTTP__TRUSTED_PROXIES stays empty. The service has no proxy and no published port.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    secrets:
+      - audit_client_key
+    # No published port. Only services on the network "services" call the audit service.
+    # The admin port 9090 stays unpublished.
+    healthcheck:
+      test: ["CMD", "/audit", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 30s
+    networks:
+      - services
+
 # Two networks (finding R4 of the PR review). Only the collector is on both.
 # A business service joins "services". It cannot reach Loki, Tempo, or Prometheus.
 networks:
   services:
   observability:
 
-# The master key file of identity and the client key of the events service. A file keeps its
+# The master key file of identity and the client keys of the events and audit services. A file keeps its
 # owner and mode (see docs/compose.md).
 secrets:
   identity_master_key:
     file: ${IDENTITY_MASTER_KEY_FILE:?Set IDENTITY_MASTER_KEY_FILE in the env file}
   events_client_key:
     file: ${EVENTS_CLIENT_KEY_FILE:?Set EVENTS_CLIENT_KEY_FILE in the env file}
+  audit_client_key:
+    file: ${AUDIT_CLIENT_KEY_FILE:?Set AUDIT_CLIENT_KEY_FILE in the env file}
 
 volumes:
   postgres-data:

@@ -15,10 +15,11 @@ chmod 0700 secrets
 openssl rand -base64 32 > secrets/identity-master-key
 # On Linux: sudo chown 65532:65532 secrets/identity-master-key && chmod 0400 secrets/identity-master-key
 # Where you cannot change the owner: chmod 0444 secrets/identity-master-key (see docs/compose.md).
-# Make the client key of the events service and the clients file of identity.
+# Make the client keys of the events and audit services and the clients file of identity.
 bash scripts/new-service-client.sh events
-# On Linux: sudo chown 65532:65532 secrets/events-client-key.pem
-# Where you cannot change the owner: chmod 0444 secrets/events-client-key.pem (see docs/compose.md).
+bash scripts/new-service-client.sh audit
+# On Linux: sudo chown 65532:65532 secrets/events-client-key.pem secrets/audit-client-key.pem
+# Where you cannot change the owner: chmod 0444 secrets/*-client-key.pem (see docs/compose.md).
 docker compose up -d
 docker compose ps
 ```
