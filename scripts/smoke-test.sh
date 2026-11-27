@@ -146,14 +146,22 @@ acl_refused() {
   expect_output "no permissions" vk_admin ACL DRYRUN "$@"
 }
 
-# No user has a selector on an audit key with +srem.
+# No user except the admin user (named default) can run SREM on an audit key. ACL DRYRUN uses the rules of the
+# user, with all selectors and all categories, so a category such as +@set or +@write also fails.
 no_srem_selector() {
-  local list
-  list="$(vk_admin ACL LIST 2>&1 | tr -d '\r')"
-  if printf '%s\n' "$list" | grep -qE '\(~audit\.[^)]*\+srem'; then
-    echo "a user has a selector on an audit key with +srem"
+  local users user key
+  users="$(vk_admin ACL USERS 2>&1 | tr -d '\r')"
+  if [ -z "$users" ] || ! printf '%s
+' "$users" | grep -qx audit; then
+    echo "the list of ACL users has no user audit: $users"
     return 1
   fi
+  for user in $users; do
+    [ "$user" = "default" ] && continue
+    for key in audit.apps audit.streams; do
+      acl_refused "$user" SREM "$key" x || { echo "user $user can run SREM on $key"; return 1; }
+    done
+  done
 }
 
 # SISMEMBER audit.apps as the admin user. Arguments: name, expected reply (0 or 1).
@@ -913,7 +921,7 @@ test_stream_after_reprovision() {
 
 # I60: a bad member in audit.apps. The script does not delete it, does not print it, and exits 0.
 test_audit_apps_bad_member() {
-  local output name
+  local output name count
   vk_admin SADD audit.apps Bad-name >/dev/null || return 1
   output="$(dc run --rm --no-deps -T provision-valkey 2>&1)" || { printf '%s\n' "$output"; vk_admin SREM audit.apps Bad-name >/dev/null; return 1; }
   vk_admin SISMEMBER audit.apps Bad-name | grep -q '^1' || { echo "Bad-name was deleted"; return 1; }
@@ -1084,7 +1092,6 @@ test_audit_reader_variable() {
     result=1
   fi
   check_audit_apps_acl events audit || result=1
-  acl_refused audit SSCAN audit.apps 0 || result=1
   rm -f "$extra_env_file"
   dc run --rm --no-deps -T provision-valkey >/dev/null 2>&1 || { echo "provision-valkey failed after the restore"; result=1; }
   if [ "$(selector_count audit)" != "7" ] || [ "$(selector_count events)" != "4" ]; then
@@ -1096,10 +1103,8 @@ test_audit_reader_variable() {
     result=1
   fi
   check_audit_apps_acl audit events || result=1
-  acl_refused events SSCAN audit.apps 0 || result=1
   return "$result"
 }
-
 
 # The CloudEvent id of one denied token entry of I58. I59 reads it. The checks run in subshells,
 # so the id goes through a file in the key folder.
@@ -1107,13 +1112,26 @@ denied_id_file() {
   printf '%s/denied-event-id' "$key_dir"
 }
 
+# The shell text that sends one raw POST /oauth/token to identity. Argument: client ID.
+# The container postgres runs the text. The body goes in as an argument of printf.
+identity_token_script() {
+  local body
+  body="grant_type=client_credentials&client_id=$1&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion=a.b.c"
+  printf '%s' "(printf 'POST /oauth/token HTTP/1.0\r\nHost: identity:8080\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: ${#body}\r\n\r\n%s' '$body'; sleep 1) | nc -w 5 identity 8080"
+}
+
 # One raw POST /oauth/token to identity from the container postgres. Argument: client ID.
 # The output has the status line, the headers, and the body.
 identity_raw_token() {
-  local body
-  body="grant_type=client_credentials&client_id=$1&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion=a.b.c"
+  dc exec -T postgres sh -c "$(identity_token_script "$1")" 2>&1 | tr -d '\r'
+}
+
+# N raw POST /oauth/token requests at the same time, from one shell in the container postgres.
+# They all arrive in a few seconds, so they are in one window of a rate limit bucket.
+# The output has one status line for each request. Arguments: client ID, N.
+identity_token_burst() {
   dc exec -T postgres sh -c \
-    "(printf 'POST /oauth/token HTTP/1.0\r\nHost: identity:8080\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: ${#body}\r\n\r\n%s' '$body'; sleep 1) | nc -w 5 identity 8080" \
+    "i=0; while [ \$i -lt $2 ]; do ( $(identity_token_script "$1") | head -n 1 ) & i=\$((i + 1)); done; wait" \
     2>&1 | tr -d '\r'
 }
 
@@ -1127,25 +1145,33 @@ count_unknown_client_denied() {
   grep -E '"grant": *"client_credentials"' | grep -E '"reason": *"invalid_client"' | grep -vcF '"clientId"' || true
 }
 
-# I58: identity 0.9.0 limits the denied token entries. 40 requests with one unknown client ID
+# I58: identity 0.9.0 limits the denied token entries. 40 requests in a short burst with one unknown client ID
 # come from one IP (the container postgres), so the bucket token_denied (30 in 1 minute) applies.
 # Identity writes no clientId for an unknown client, so the check filters by grant and reason.
 test_identity_denied_limit() {
-  local last cid i out code count end
+  local last cid out code count end
   last="$(vk_admin XREVRANGE audit.stream:identity + - COUNT 1 2>&1 | tr -d '\r' | head -n 1)"
   case "$last" in
     [0-9]*-[0-9]*) ;;
     *) last="0-0" ;;
   esac
   cid="smoke-unknown-$(openssl rand -hex 8)"
-  for i in $(seq 1 40); do
-    out="$(identity_raw_token "$cid")"
-    code="$(http_code "$out")"
-    if [ "$code" != "401" ] || ! printf '%s\n' "$out" | grep -qF 'invalid_client'; then
-      echo "request $i got status $code: $(printf "%s" "$out" | tail -n 3)"
-      return 1
-    fi
-  done
+  # One full request, then a burst of 39 requests. The 40 requests are in one 1 minute window.
+  out="$(identity_raw_token "$cid")"
+  code="$(http_code "$out")"
+  if [ "$code" != "401" ] || ! printf '%s
+' "$out" | grep -qF 'invalid_client'; then
+    echo "request 1 got status $code: $(printf "%s" "$out" | tail -n 3)"
+    return 1
+  fi
+  out="$(identity_token_burst "$cid" 39)"
+  count="$(printf '%s
+' "$out" | grep -cE '^HTTP/[0-9.]+ 401' || true)"
+  if [ "$count" != "39" ]; then
+    echo "$count of 39 burst requests got status 401: $(printf '%s
+' "$out" | sort | uniq -c | head -n 5)"
+    return 1
+  fi
   end=$((SECONDS + 30))
   while :; do
     count="$(identity_entries_after "$last" | count_unknown_client_denied)"
@@ -1192,6 +1218,7 @@ test_identity_entry_in_audit() {
     sleep 3
   done
 }
+
 # I55: the database role and the Valkey user of the audit service are isolated.
 test_audit_isolation() {
   local pw

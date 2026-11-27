@@ -176,6 +176,8 @@ case "$reply" in
     old_ifs="$IFS"
     IFS='
 '
+    # Turn off pathname globbing. A member such as "*" must not expand to file names.
+    set -f
     for member in $members; do
       [ -n "$member" ] || continue
       if ! check_name "$member"; then
@@ -191,6 +193,7 @@ case "$reply" in
         echo "valkey: unregistered $member"
       fi
     done
+    set +f
     IFS="$old_ifs"
     ;;
   *)
