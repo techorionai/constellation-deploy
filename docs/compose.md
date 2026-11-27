@@ -1,6 +1,6 @@
 # Docker Compose base
 
-`compose.yaml` runs the base of the platform on one host: PostgreSQL, Valkey, and the Grafana LGTM stack (OpenTelemetry Collector, Prometheus, Loki, Tempo, and Grafana). Each part is a separate container.
+`compose.yaml` runs the base of the platform on one host: PostgreSQL, Valkey, and the Grafana LGTM stack (OpenTelemetry Collector, Prometheus, Loki, Tempo, and Grafana). Each part is a separate container. It also runs the platform services identity, events, and audit.
 
 ## Requirements
 
@@ -22,16 +22,17 @@
 
    Then set the owner and the mode of the file (see "Master key").
 
-5. Make the client key of the events service and the clients file of identity (see "Service clients"). Run this step before `docker compose up -d`. Without the clients file, identity does not start, and Docker makes no directory at the missing path.
+5. Make the client keys of the events and audit services and the clients file of identity (see "Service clients"). Run this step before `docker compose up -d`. Without the clients file, identity does not start, and Docker makes no directory at the missing path.
 
    ```sh
    bash scripts/new-service-client.sh events
+   bash scripts/new-service-client.sh audit
    ```
 
-   Then set the owner of the key as the script prints (`sudo chown 65532:65532 secrets/events-client-key.pem`). On Docker Desktop, use the fallback in "Service clients".
+   Then set the owner of the key as the script prints (`sudo chown 65532:65532 secrets/events-client-key.pem secrets/audit-client-key.pem`). On Docker Desktop, use the fallback in "Service clients".
 
 6. Start the base: `docker compose up -d`.
-7. Examine the states: `docker compose ps`. The services `postgres`, `valkey`, `prometheus`, `grafana`, `identity`, and `events` show `healthy`. The collector, Loki, and Tempo show `running`, because their images have no shell for a health check. The services `provision-postgres` and `provision-valkey` show `exited (0)`.
+7. Examine the states: `docker compose ps`. The services `postgres`, `valkey`, `prometheus`, `grafana`, `identity`, `events`, and `audit` show `healthy`. The collector, Loki, and Tempo show `running`, because their images have no shell for a health check. The services `provision-postgres` and `provision-valkey` show `exited (0)`.
 8. Open Grafana at `http://127.0.0.1:3000`. Log in with `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD`.
 
 Use `docker compose up -d` and not `docker compose up -d --wait` for the base. Compose 5 returns an error for `--wait` when a one-shot service exits and no other service depends on it. A service block that depends on both provisioning services (see "Add a service") works with `--wait`.
@@ -59,6 +60,10 @@ All settings are in `.env`. Compose reads `.env` in the project folder. The vari
 | `EVENTS_DB_PASSWORD`, `EVENTS_DB_PASSWORD_URLENCODED`, `EVENTS_VALKEY_PASSWORD` | none | Database and Valkey passwords of the events service. The second value is the URL-encoded form of the first. |
 | `EVENTS_CLIENT_KEY_FILE` | none | Path of the client key file of the events service on the host. |
 | `EVENTS_CLIENT_KEY_ID` | none | ID of the client key. It is not a secret. |
+| `AUDIT_DB_PASSWORD`, `AUDIT_DB_PASSWORD_URLENCODED`, `AUDIT_VALKEY_PASSWORD` | none | Database and Valkey passwords of the audit service. The second value is the URL-encoded form of the first. |
+| `AUDIT_CLIENT_KEY_FILE` | none | Path of the client key file of the audit service on the host. |
+| `AUDIT_CLIENT_KEY_ID` | none | ID of the client key. It is not a secret. |
+| `AUDIT_STREAM_READER` | `audit` | The one service user that reads the audit streams (see "Audit stream ACL"). It must be in `CONSTELLATION_SERVICES`. |
 | `IDENTITY_BIND`, `IDENTITY_PORT` | `127.0.0.1`, `8080` | Host IP and host port of identity. Keep the bind on loopback unless a TLS reverse proxy runs on the same host. |
 | `IDENTITY_TRUSTED_PROXIES` | empty | CIDR list of the reverse proxies in front of identity. Set it when you use a proxy (see "Identity"). |
 | `IDENTITY_GOOGLE_CLIENT_ID` | empty (off) | Client ID of the Google OAuth client. Setting it turns on the login with Google. Store the client secret first (see "Upstream login"). |
@@ -234,6 +239,34 @@ Limit: the ACL cannot isolate consumer groups. A service can acknowledge or clai
 
 An existing install gets the selectors after `docker compose run --rm provision-valkey`.
 
+## Audit service
+
+The service `audit` is the audit service of the platform. It uses the image `ghcr.io/techorionai/constellation-audit:0.1.0`, the database `audit`, and the Valkey user `audit`. It has no published port. Only services on the network `services` call it. Its API port `8080` and its admin port `9090` are not published.
+
+- It is a service client with no role. It reads the private key as the Compose secret `audit_client_key` from the file `AUDIT_CLIENT_KEY_FILE`. It is ready only after it publishes its manifest to identity. If `readyz` does not give 200, examine `AUDIT_CLIENT_KEY_ID` and the clients file first.
+- The manifest of the audit service has the role `reader`. Identity makes the role `audit:reader`, which gives the permission `audit:log:read`. Give this role to the person or the service that searches and exports audit entries.
+- Pool rule: the service needs `AUDIT_DATABASE__MAX_CONNS` of at least `4 + 2 x AUDIT_EXPORT__CONCURRENCY`. The default concurrency is 2, so the minimum is 8. `compose.yaml` sets `AUDIT_DATABASE__MAX_CONNS` to 8. If you set a higher `AUDIT_EXPORT__CONCURRENCY`, also set a higher `AUDIT_DATABASE__MAX_CONNS`. Else the service stops with a configuration error. The value must stay lower than `SERVICE_DB_CONNECTION_LIMIT`.
+- `AUDIT_HTTP__TRUSTED_PROXIES` stays empty in `compose.yaml`, because the service has no proxy. If a caller that is not a proxy could send forwarded headers, the caller could write a false IP address into its own export entry. If you add a reverse proxy in front of the audit service, set `AUDIT_HTTP__TRUSTED_PROXIES` to the CIDR of the proxy.
+- The images of identity and events in this release have no audit writer. They write audit entries after an update to `constellation-platform-go` `v0.7.0` and a new image.
+
+## Audit stream ACL
+
+`provision-valkey` gives each Valkey user two selectors to write audit entries. The text is the same as `AuditProducerSelectors(app)` of `constellation-platform-go` `v0.7.0`.
+
+- `(~audit.stream:<svc> +xadd +xtrim)` lets a service write and trim only its own audit stream.
+- `(~audit.streams +sadd)` lets a service add its name to the set `audit.streams`.
+
+Only the user that `AUDIT_STREAM_READER` names also gets the two reader selectors of `AuditReaderSelectors()`. The default is `audit`.
+
+- `(~audit.stream:* +xreadgroup +xack +xautoclaim +xpending +xinfo|groups +xinfo|stream +xinfo|consumers +xgroup|create +xgroup|createconsumer +xgroup|delconsumer +xrange)` lets the reader read and acknowledge entries on each audit stream.
+- `(~audit.streams +sscan)` lets the reader list the set with `SSCAN`. The ACL does not allow `SMEMBERS`.
+
+`AUDIT_STREAM_READER` must be in `CONSTELLATION_SERVICES` and must follow the name rule. `provision/valkey.sh` checks this before it changes anything. A service that is not the reader cannot read an audit stream or list the set.
+
+Limits: the ACL allows `SADD` with any value, so a producer can add false names to the set. The audit service keeps its known apps in its own table for this reason. The ACL cannot isolate consumer groups on the audit streams, as on the event streams.
+
+An existing install gets the selectors after `docker compose run --rm provision-valkey`.
+
 ## Service clients
 
 A platform service that gets tokens from identity needs a client entry in the clients file of identity and a private key. The script `scripts/new-service-client.sh` makes both.
@@ -268,7 +301,7 @@ Backup: keep a copy of the folder `secrets/`. It has the master key of identity,
 Two one-shot services make the objects. They are idempotent. A second run gives the same result.
 
 - `provision-postgres` makes the role `<svc>` and the database `<svc>` with the role as owner. It removes the `CONNECT` permission of `PUBLIC` and gives it to the role. A service cannot connect to the database of another service. The script also removes `CONNECT` and `TEMP` of `PUBLIC` on the databases `postgres` and `template1`, and it sets `CONNECTION LIMIT` of each role to `SERVICE_DB_CONNECTION_LIMIT`.
-- `provision-valkey` makes the ACL user `<svc>`. The user can use the keys `<svc>:*` and the commands `+@all -@admin -@dangerous -@scripting -function -scan -randomkey -dbsize -memory`. Valkey does not filter `SCAN`, `RANDOMKEY`, `DBSIZE`, and `MEMORY` by key pattern, so they would show the key names of other services. A script (`EVAL`) can block Valkey for all services, so scripts are off. Each user also has two selectors for the event streams (see "Event stream ACL"). The script saves the users to the ACL file in the `valkey-data` volume, so they stay after a restart. The ACL file has the SHA-256 hash of each password, not the password.
+- `provision-valkey` makes the ACL user `<svc>`. The user can use the keys `<svc>:*` and the commands `+@all -@admin -@dangerous -@scripting -function -scan -randomkey -dbsize -memory`. Valkey does not filter `SCAN`, `RANDOMKEY`, `DBSIZE`, and `MEMORY` by key pattern, so they would show the key names of other services. A script (`EVAL`) can block Valkey for all services, so scripts are off. Each user also has two selectors for the event streams (see "Event stream ACL") and two selectors for the audit streams (see "Audit stream ACL"). The reader user has two more. The script saves the users to the ACL file in the `valkey-data` volume, so they stay after a restart. The ACL file has the SHA-256 hash of each password, not the password.
 
 The scripts do not print passwords, and they do not put passwords on a command line. The scripts reject the placeholder `change-me`, a password with fewer than 12 characters, and a Valkey password with white space, before they change anything. Services connect to PostgreSQL directly. Do not put a pooler in transaction mode between them, because it breaks the advisory locks of the migrations.
 
@@ -278,7 +311,8 @@ The scripts do not print passwords, and they do not put passwords on a command l
 2. Add `<SVC>_DB_PASSWORD` and `<SVC>_VALKEY_PASSWORD` to `.env`.
 3. If the service gets tokens from identity, run `bash scripts/new-service-client.sh <svc> [role ...]` and follow the steps that it prints (see "Service clients").
 4. Add a service block to `compose.yaml` (the template below). The `events` block is an example of a service client.
-5. Run the provisioning services: `docker compose run --rm provision-postgres` and `docker compose run --rm provision-valkey`. Then run `docker compose up -d`. Use `docker compose run --rm` because `docker compose up -d` does not start an exited one-shot container again when its configuration did not change.
+5. A new service gets 4 selectors: two for event streams and two for audit streams. Only the user that `AUDIT_STREAM_READER` names reads audit streams. Do not name a new service as the reader.
+6. Run the provisioning services: `docker compose run --rm provision-postgres` and `docker compose run --rm provision-valkey`. Then run `docker compose up -d`. Use `docker compose run --rm` because `docker compose up -d` does not start an exited one-shot container again when its configuration did not change.
 
 Template for a service `identity`. Use the exact version tag of the image in place of `<version>` (for example `0.1.0`). Replace `identity` and `IDENTITY` with the name of the service. URL-encode the password in `DATABASE__URL`. A platform service joins the `services` network only. Add the same hardening as the base services.
 
@@ -384,7 +418,7 @@ bash tests/new-service-client-cases.sh  # Tests of scripts/new-service-client.sh
 bash scripts/smoke-test.sh           # Live containers. Takes some minutes.
 ```
 
-Check 5 of `scripts/check-compose.sh` requires the value `change-me` for each variable in `.env.example` that has `PASSWORD`, `SECRET`, `TOKEN`, or `KEY` in its name. Only the four exact names `IDENTITY_MASTER_KEY_FILE`, `IDENTITY_MASTER_KEY_ID`, `EVENTS_CLIENT_KEY_FILE`, and `EVENTS_CLIENT_KEY_ID` can have any value. A name with the suffix `_FILE` or `_ID` is not exempt.
+Check 5 of `scripts/check-compose.sh` requires the value `change-me` for each variable in `.env.example` that has `PASSWORD`, `SECRET`, `TOKEN`, or `KEY` in its name. Only the six exact names `IDENTITY_MASTER_KEY_FILE`, `IDENTITY_MASTER_KEY_ID`, `EVENTS_CLIENT_KEY_FILE`, `EVENTS_CLIENT_KEY_ID`, `AUDIT_CLIENT_KEY_FILE`, and `AUDIT_CLIENT_KEY_ID` can have any value. A name with the suffix `_FILE` or `_ID` is not exempt.
 
 Run `scripts/smoke-test.sh` directly on the host, not under `act`. A relative bind mount does not work under `act` with a Docker Desktop host. The script uses the project name `constellation-smoke` and the values of `tests/smoke.env`. The values in this file are for tests only. The script removes its containers and volumes at the end.
 
@@ -417,3 +451,15 @@ The release `v0.3.0` adds the events service and the event stream ACL. It moves 
 7. Examine the states with `docker compose ps`.
 
 Identity `0.6.0` to `0.7.1`: client credentials tokens get the `app` claim. Read the release notes of identity `v0.7.0` and `v0.7.1` before the update.
+
+## Upgrade from v0.3.0 to v0.4.0
+
+The release `v0.4.0` adds the audit service and the audit stream ACL. Do these steps in this order:
+
+1. Make a backup of the databases and of the folder `secrets/`.
+2. Get the files of the release `v0.4.0`.
+3. In `.env`, add `audit` to `CONSTELLATION_SERVICES`. Add `AUDIT_STREAM_READER=audit`, `AUDIT_DB_PASSWORD`, `AUDIT_DB_PASSWORD_URLENCODED`, `AUDIT_VALKEY_PASSWORD`, `AUDIT_CLIENT_KEY_FILE`, and `AUDIT_CLIENT_KEY_ID`. Until these values exist, each Compose command stops with an error that names the variable.
+4. Run `bash scripts/new-service-client.sh audit`. Set the owner of the key as the script says.
+5. Restart identity, because it reads the clients file only at the start: `docker compose restart identity`.
+6. Run `docker compose pull`, `docker compose run --rm provision-postgres`, and `docker compose run --rm provision-valkey`, then `docker compose up -d`. Without the run of `provision-valkey`, the Valkey users keep the old ACL.
+7. Examine the states with `docker compose ps`. The service `audit` shows `healthy`.
