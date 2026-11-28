@@ -19,7 +19,7 @@ services:
     restart: unless-stopped
     # The entrypoint rejects a weak admin password. Then it calls the image entrypoint.
     entrypoint: ["sh", "/provision/postgres-entrypoint.sh"]
-    command: ["postgres", "-c", "max_connections=${POSTGRES_MAX_CONNECTIONS:-200}"]
+    command: ["postgres", "-c", "max_connections=${POSTGRES_MAX_CONNECTIONS:-250}"]
     # The image entrypoint changes the owner of the data folder and starts PostgreSQL
     # as the postgres user.
     cap_add:
@@ -371,13 +371,76 @@ services:
     networks:
       - services
 
+  helpdesk:
+    <<: *hardened
+    image: ghcr.io/techorionai/constellation-helpdesk:0.1.0
+    restart: unless-stopped
+    read_only: true
+    depends_on:
+      provision-postgres:
+        condition: service_completed_successfully
+      provision-valkey:
+        condition: service_completed_successfully
+      otel-collector:
+        condition: service_started
+      identity:
+        condition: service_healthy
+      events:
+        condition: service_healthy
+    environment:
+      HELPDESK_DATABASE__URL: postgres://helpdesk:${HELPDESK_DB_PASSWORD_URLENCODED:?Set HELPDESK_DB_PASSWORD_URLENCODED}@postgres:5432/helpdesk?sslmode=disable
+      HELPDESK_DATABASE__NAME: helpdesk
+      HELPDESK_DATABASE__MAX_CONNS: "8"
+      HELPDESK_VALKEY__ADDRESS: valkey:6379
+      HELPDESK_VALKEY__USERNAME: helpdesk
+      HELPDESK_VALKEY__PASSWORD: ${HELPDESK_VALKEY_PASSWORD:?Set HELPDESK_VALKEY_PASSWORD in the env file}
+      HELPDESK_VALKEY__KEY_PREFIX: helpdesk
+      # CIDR list of the reverse proxies in front of the helpdesk. Empty means no proxy.
+      HELPDESK_HTTP__TRUSTED_PROXIES: ${HELPDESK_TRUSTED_PROXIES:-}
+      # The service client of the helpdesk. The private key is the Compose secret
+      # helpdesk_client_key. The key ID and the key path are not secrets.
+      HELPDESK_CLIENT__ID: helpdesk
+      HELPDESK_CLIENT__KEY_ID: ${HELPDESK_CLIENT_KEY_ID:?Set HELPDESK_CLIENT_KEY_ID in the env file}
+      HELPDESK_CLIENT__PRIVATE_KEY_FILE: /run/secrets/helpdesk_client_key
+      HELPDESK_CLIENT__ISSUER: ${IDENTITY_ISSUER:?Set IDENTITY_ISSUER in the env file}
+      HELPDESK_CLIENT__TOKEN_URL: http://identity:8080/oauth/token
+      # The services talk to identity on the internal network with HTTP.
+      HELPDESK_CLIENT__ALLOW_INSECURE_HTTP: "true"
+      HELPDESK_IDENTITY__URL: http://identity:8080
+      HELPDESK_IDENTITY__ALLOW_INSECURE_HTTP: "true"
+      HELPDESK_EVENTS__URL: http://events:8080
+      HELPDESK_EVENTS__ALLOW_INSECURE_HTTP: "true"
+      HELPDESK_AUTH__ISSUER: ${IDENTITY_ISSUER:?Set IDENTITY_ISSUER in the env file}
+      HELPDESK_AUTH__JWKS_URL: http://identity:8080/.well-known/jwks.json
+      HELPDESK_AUTH__ALLOW_INSECURE_HTTP: "true"
+      # The introspection URL must be the address in the network. The default comes from the issuer.
+      HELPDESK_AUTH__INTROSPECT__ISSUER: ${IDENTITY_ISSUER:?Set IDENTITY_ISSUER in the env file}
+      HELPDESK_AUTH__INTROSPECT__URL: http://identity:8080/oauth/introspect
+      HELPDESK_AUTH__INTROSPECT__ALLOW_INSECURE_HTTP: "true"
+      # Age limit of the audit stream. A longer period than the longest stop of the audit service. See docs/compose.md.
+      HELPDESK_RETENTION__AUDIT_STREAM__PERIOD: ${AUDIT_STREAM_RETENTION:-24h}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    secrets:
+      - helpdesk_client_key
+    # Only the public port. The admin port 9090 stays unpublished.
+    ports:
+      - "${HELPDESK_BIND:-127.0.0.1}:${HELPDESK_PORT:-8081}:8080"
+    healthcheck:
+      test: ["CMD", "/helpdesk", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 30s
+    networks:
+      - services
+
 # Two networks (finding R4 of the PR review). Only the collector is on both.
 # A business service joins "services". It cannot reach Loki, Tempo, or Prometheus.
 networks:
   services:
   observability:
 
-# The master key file of identity and the client keys of the events and audit services. A file keeps its
+# The master key file of identity and the client keys of the events, audit, and helpdesk services. A file keeps its
 # owner and mode (see docs/compose.md).
 secrets:
   identity_master_key:
@@ -386,6 +449,8 @@ secrets:
     file: ${EVENTS_CLIENT_KEY_FILE:?Set EVENTS_CLIENT_KEY_FILE in the env file}
   audit_client_key:
     file: ${AUDIT_CLIENT_KEY_FILE:?Set AUDIT_CLIENT_KEY_FILE in the env file}
+  helpdesk_client_key:
+    file: ${HELPDESK_CLIENT_KEY_FILE:?Set HELPDESK_CLIENT_KEY_FILE in the env file}
 
 volumes:
   postgres-data:

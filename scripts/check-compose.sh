@@ -105,8 +105,8 @@ fi
 
 # 5. Each password, secret, token, and key in .env.example is a placeholder.
 # The variable name has the word PASSWORD, SECRET, TOKEN, or KEY between underscores.
-# Six exact names hold no secret: IDENTITY_MASTER_KEY_FILE, EVENTS_CLIENT_KEY_FILE, and AUDIT_CLIENT_KEY_FILE (paths),
-# IDENTITY_MASTER_KEY_ID, EVENTS_CLIENT_KEY_ID, and AUDIT_CLIENT_KEY_ID
+# Eight exact names hold no secret: IDENTITY_MASTER_KEY_FILE, EVENTS_CLIENT_KEY_FILE, AUDIT_CLIENT_KEY_FILE, and HELPDESK_CLIENT_KEY_FILE (paths),
+# IDENTITY_MASTER_KEY_ID, EVENTS_CLIENT_KEY_ID, AUDIT_CLIENT_KEY_ID, and HELPDESK_CLIENT_KEY_ID
 # (identifiers). They can have any value. No other name is exempt.
 secret_re='^([A-Za-z0-9_]*_)?(PASSWORD|SECRET|TOKEN|KEY)(_[A-Za-z0-9_]*)?='
 if [ -f "$example_file" ]; then
@@ -114,7 +114,7 @@ if [ -f "$example_file" ]; then
     name="${line%%=*}"
     value="${line#*=}"
     case "$name" in
-      IDENTITY_MASTER_KEY_FILE | IDENTITY_MASTER_KEY_ID | EVENTS_CLIENT_KEY_FILE | EVENTS_CLIENT_KEY_ID | AUDIT_CLIENT_KEY_FILE | AUDIT_CLIENT_KEY_ID) continue ;;
+      IDENTITY_MASTER_KEY_FILE | IDENTITY_MASTER_KEY_ID | EVENTS_CLIENT_KEY_FILE | EVENTS_CLIENT_KEY_ID | AUDIT_CLIENT_KEY_FILE | AUDIT_CLIENT_KEY_ID | HELPDESK_CLIENT_KEY_FILE | HELPDESK_CLIENT_KEY_ID) continue ;;
     esac
     if [ "$value" != "change-me" ]; then
       fail example-secret "$name"
@@ -187,11 +187,11 @@ done < <(find "$folder" -name '*.sh' -not -path '*/.git/*' -print0)
   check_no_whitespace TEST_PASSWORD "no-space-here" 2>/dev/null || exit 1
 ) || fail password-rules "provision/check-password.sh"
 
-# 9. Identity and events set the retention of the audit stream. Without it, the image default of
+# 9. Identity, events, and the helpdesk set the retention of the audit stream. Without it, the image default of
 # 168h applies and failed token requests can fill the Valkey memory. The check applies only
-# if the Compose file runs the identity image or the events image.
+# if the Compose file runs the identity image, the events image, or the helpdesk image.
 if [ -f "$compose_file" ]; then
-  for pair in "constellation-identity:IDENTITY_RETENTION__AUDIT_STREAM__PERIOD" "constellation-events:EVENTS_RETENTION__AUDIT_STREAM__PERIOD"; do
+  for pair in "constellation-identity:IDENTITY_RETENTION__AUDIT_STREAM__PERIOD" "constellation-events:EVENTS_RETENTION__AUDIT_STREAM__PERIOD" "constellation-helpdesk:HELPDESK_RETENTION__AUDIT_STREAM__PERIOD"; do
     img="${pair%%:*}"
     var="${pair#*:}"
     if grep -qE "image:.*/$img:" "$compose_file" && ! grep -qE "^[[:space:]]+$var:[[:space:]]*[^[:space:]]" "$compose_file"; then

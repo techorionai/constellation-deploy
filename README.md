@@ -4,7 +4,7 @@ Deployment files of the Constellation platform.
 
 ## Compose base
 
-`compose.yaml` runs PostgreSQL, Valkey, and the Grafana LGTM stack (OpenTelemetry Collector, Prometheus, Loki, Tempo, and Grafana) on one host. A provisioning step makes one PostgreSQL database and role, and one Valkey ACL user, for each platform service. The first platform services are `identity`, the identity provider, and `events`, the events service.
+`compose.yaml` runs PostgreSQL, Valkey, and the Grafana LGTM stack (OpenTelemetry Collector, Prometheus, Loki, Tempo, and Grafana) on one host. A provisioning step makes one PostgreSQL database and role, and one Valkey ACL user, for each platform service. The first platform services are `identity`, the identity provider, `events`, the events service, `audit`, the audit service, and `helpdesk`, the helpdesk service.
 
 ```sh
 cp .env.example .env
@@ -15,10 +15,11 @@ chmod 0700 secrets
 openssl rand -base64 32 > secrets/identity-master-key
 # On Linux: sudo chown 65532:65532 secrets/identity-master-key && chmod 0400 secrets/identity-master-key
 # Where you cannot change the owner: chmod 0444 secrets/identity-master-key (see docs/compose.md).
-# Make the client keys of the events and audit services and the clients file of identity.
+# Make the client keys of the events, audit, and helpdesk services and the clients file of identity.
 bash scripts/new-service-client.sh events
 bash scripts/new-service-client.sh audit
-# On Linux: sudo chown 65532:65532 secrets/events-client-key.pem secrets/audit-client-key.pem
+bash scripts/new-service-client.sh helpdesk events:producer
+# On Linux: sudo chown 65532:65532 secrets/events-client-key.pem secrets/audit-client-key.pem secrets/helpdesk-client-key.pem
 # Where you cannot change the owner: chmod 0444 secrets/*-client-key.pem (see docs/compose.md).
 docker compose up -d
 docker compose ps

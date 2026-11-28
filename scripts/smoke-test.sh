@@ -259,7 +259,7 @@ test_up() {
 check_states() {
   local states service state health code
   states="$(dc ps -a --format '{{.Service}} {{.State}} {{.Health}} {{.ExitCode}}')"
-  for service in postgres valkey prometheus grafana identity events audit; do
+  for service in postgres valkey prometheus grafana identity events audit helpdesk; do
     health="$(printf '%s\n' "$states" | awk -v s="$service" '$1 == s { print $3 }')"
     if [ "$health" != "healthy" ]; then
       echo "$service is not healthy: $health"
@@ -497,6 +497,12 @@ make_keys() {
     events >/dev/null || return 1
   bash scripts/new-service-client.sh --secrets-dir "$key_dir" --clients-file "$key_dir/identity-clients.yaml" \
     audit >/dev/null || return 1
+  bash scripts/new-service-client.sh --secrets-dir "$key_dir" --clients-file "$key_dir/identity-clients.yaml" \
+    helpdesk events:producer >/dev/null || return 1
+  # The smoke client calls the helpdesk and reads the event catalog. Only the host reads its key.
+  bash scripts/new-service-client.sh --secrets-dir "$key_dir" --clients-file "$key_dir/identity-clients.yaml" \
+    smoke_helpdesk helpdesk:support_agent events:reader >/dev/null || return 1
+  chmod 0444 "$key_dir/helpdesk-client-key.pem"
   chmod 0444 "$key_dir/audit-client-key.pem"
   chmod 0444 "$key_dir/events-client-key.pem"
   # Docker on Windows needs a Windows path. Git Bash gives one with cygpath.
@@ -507,8 +513,9 @@ make_keys() {
   IDENTITY_MASTER_KEY_FILE="$host_dir/identity-master-key"
   EVENTS_CLIENT_KEY_FILE="$host_dir/events-client-key.pem"
   AUDIT_CLIENT_KEY_FILE="$host_dir/audit-client-key.pem"
+  HELPDESK_CLIENT_KEY_FILE="$host_dir/helpdesk-client-key.pem"
   IDENTITY_CLIENTS_PATH="$host_dir/identity-clients.yaml"
-  export IDENTITY_MASTER_KEY_FILE EVENTS_CLIENT_KEY_FILE AUDIT_CLIENT_KEY_FILE IDENTITY_CLIENTS_PATH
+  export IDENTITY_MASTER_KEY_FILE EVENTS_CLIENT_KEY_FILE AUDIT_CLIENT_KEY_FILE HELPDESK_CLIENT_KEY_FILE IDENTITY_CLIENTS_PATH
 }
 
 # Read a URL from the container postgres. It is in the network "services", like a business service.
@@ -1314,7 +1321,236 @@ test_identity_missing_clients_file() {
   fi
 }
 
-make_keys || { echo "FAIL: the keys of identity, events, and audit"; exit 1; }
+# Encode the text on stdin as base64url with no padding.
+b64url() {
+  openssl base64 -A | tr '+/' '-_' | tr -d '='
+}
+
+# Convert an ES256 signature from the DER form of openssl to the raw form r || s (64 bytes).
+# The signature is on stdin as binary data. The output is binary data.
+der_to_raw() {
+  local hex rlen slen r s pos
+  hex="$(od -An -tx1 -v | tr -d ' \n')"
+  [ "${hex:0:2}" = "30" ] && [ "${hex:4:2}" = "02" ] || return 1
+  rlen=$((16#${hex:6:2}))
+  r="${hex:8:$((rlen * 2))}"
+  pos=$((8 + rlen * 2))
+  [ "${hex:$pos:2}" = "02" ] || return 1
+  slen=$((16#${hex:$((pos + 2)):2}))
+  s="${hex:$((pos + 4)):$((slen * 2))}"
+  # An integer in DER can have a leading zero byte, or can be shorter than 32 bytes.
+  while [ "${#r}" -gt 64 ]; do r="${r:2}"; done
+  while [ "${#s}" -gt 64 ]; do s="${s:2}"; done
+  r="$(printf '%064s' "$r" | tr ' ' 0)"
+  s="$(printf '%064s' "$s" | tr ' ' 0)"
+  # shellcheck disable=SC2059
+  printf "$(printf '%s%s' "$r" "$s" | sed 's/../\\x&/g')"
+}
+
+# One HTTP/1.0 request from the container postgres to a service in the network "services".
+# The output has the status line, the headers, and the body, with no CR characters.
+# Arguments: host, port, method, path, bearer token (can be empty), content type, body.
+net_http() {
+  local host="$1" port="$2" method="$3" path="$4" token="$5" ctype="$6" body="${7:-}" auth=""
+  if [ -n "$token" ]; then
+    auth="Authorization: Bearer $token"$'\r\n'
+  fi
+  printf '%s %s HTTP/1.0\r\nHost: %s:%s\r\n%sContent-Type: %s\r\nContent-Length: %s\r\n\r\n%s' \
+    "$method" "$path" "$host" "$port" "$auth" "$ctype" "${#body}" "$body" |
+    dc exec -T postgres sh -c "(cat; sleep 2) | nc -w 5 $host $port" 2>&1 | tr -d '\r'
+}
+
+# The status code of the output of net_http (on stdin).
+http_status_of() {
+  sed -n '1s/^HTTP\/[0-9.]* \([0-9]*\).*/\1/p'
+}
+
+# The body of the output of net_http (on stdin).
+http_body_of() {
+  sed '1,/^$/d'
+}
+
+# The first string value of a JSON key in the text on stdin. Argument: key.
+json_string() {
+  grep -o "\"$1\" *: *\"[^\"]*\"" | head -n 1 | sed 's/^[^:]*: *"//;s/"$//'
+}
+
+# Get an access token with a client credentials grant and a private_key_jwt assertion.
+# Arguments: client name, audience, scopes (separated by spaces). The key of the client is
+# $key_dir/<client>-client-key.pem and the key ID is <client>-1. The assertion has the audience
+# IDENTITY_ISSUER. Each call has a new jti. The output is the access token. If the status is not
+# 200, the output is the status and the error code, and the return code is 1.
+client_token() {
+  local client="$1" audience="$2" scopes="$3" keyfile kid header claims input sig now jti form out status
+  kid="$client-1"
+  now="$(date +%s)"
+  jti="$(openssl rand -hex 16)"
+  header="$(printf '{"alg":"ES256","typ":"JWT","kid":"%s"}' "$kid" | b64url)"
+  claims="$(printf '{"iss":"%s","sub":"%s","aud":"%s","jti":"%s","iat":%s,"exp":%s}' \
+    "$client" "$client" "$(envval IDENTITY_ISSUER)" "$jti" "$now" "$((now + 240))" | b64url)"
+  input="$header.$claims"
+  # The openssl of Git Bash on Windows is a native build. It needs a Windows path.
+  keyfile="$key_dir/$client-client-key.pem"
+  if command -v cygpath >/dev/null 2>&1; then
+    keyfile="$(cygpath -m "$keyfile")"
+  fi
+  sig="$(printf '%s' "$input" | openssl dgst -sha256 -sign "$keyfile" | der_to_raw | b64url)" || return 1
+  form="grant_type=client_credentials&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer"
+  form="$form&client_assertion=$input.$sig&audience=$audience&scope=${scopes// /%20}"
+  form="${form//:/%3A}"
+  out="$(net_http identity 8080 POST /oauth/token "" application/x-www-form-urlencoded "$form")"
+  status="$(printf '%s\n' "$out" | http_status_of)"
+  if [ "$status" != "200" ]; then
+    echo "token request status $status, error $(printf '%s\n' "$out" | http_body_of | json_string error)"
+    return 1
+  fi
+  printf '%s\n' "$out" | http_body_of | json_string access_token
+}
+
+helpdesk_healthy() {
+  [ "$(dc ps --format '{{.Service}} {{.Health}}' | awk '$1 == "helpdesk" { print $2 }')" = "healthy" ]
+}
+
+helpdesk_ready() {
+  svc_get http://helpdesk:9090/readyz >/dev/null
+}
+
+# S1: the helpdesk is healthy and its readiness endpoint gives 200. It is ready only after it
+# published its event types and its manifest to the events service.
+test_helpdesk_healthy() {
+  if ! poll 120 helpdesk_healthy; then
+    echo "helpdesk is not healthy in 120 seconds"
+    dc logs --tail 30 helpdesk
+    return 1
+  fi
+  poll 120 helpdesk_ready || { echo "helpdesk /readyz is not 200"; dc logs --tail 30 helpdesk; return 1; }
+}
+
+# S2: the Valkey user helpdesk writes its own event stream and audit stream. It cannot write the
+# audit stream of another app. The name is a member of audit.apps.
+test_helpdesk_acl() {
+  acl_allowed helpdesk XADD events.stream:helpdesk '*' k v || return 1
+  acl_allowed helpdesk XADD audit.stream:helpdesk '*' k v || return 1
+  acl_refused helpdesk XADD audit.stream:events '*' k v || return 1
+  expect_registered helpdesk 1
+}
+
+# The number of rows of audit_entries. Argument: the WHERE condition.
+audit_count() {
+  pg audit "$(envval AUDIT_DB_PASSWORD)" audit -c "SELECT count(*) FROM audit_entries WHERE $1" | tr -d '\r'
+}
+
+# Wait until a condition on audit_entries has one row or more. Arguments: the limit in seconds, the condition.
+wait_audit_rows() {
+  local end=$((SECONDS + $1)) rows
+  while :; do
+    rows="$(audit_count "$2")"
+    [ -n "$rows" ] && [ "$rows" != "0" ] && return 0
+    if [ "$SECONDS" -ge "$end" ]; then
+      echo "no row in audit_entries in $1 seconds for: $2"
+      return 1
+    fi
+    sleep 3
+  done
+}
+
+# S3 and S4: a scoped service token creates a customer and a ticket. The audit database has the entry.
+test_helpdesk_create() {
+  local token out status customer ticket
+  token="$(client_token smoke_helpdesk helpdesk "helpdesk:customer:write helpdesk:ticket:write")" ||
+    { echo "$token"; return 1; }
+  out="$(net_http helpdesk 8080 POST /v1/customers "$token" application/json \
+    "{\"name\":\"Smoke Customer\",\"email\":\"smoke-$(openssl rand -hex 6)@example.test\"}")"
+  status="$(printf '%s\n' "$out" | http_status_of)"
+  customer="$(printf '%s\n' "$out" | http_body_of | json_string id)"
+  if [ "$status" != "201" ] || [ -z "$customer" ]; then
+    echo "POST /v1/customers gave: $out"
+    return 1
+  fi
+  out="$(net_http helpdesk 8080 POST /v1/tickets "$token" application/json \
+    "{\"subject\":\"Smoke ticket\",\"customerId\":\"$customer\"}")"
+  status="$(printf '%s\n' "$out" | http_status_of)"
+  ticket="$(printf '%s\n' "$out" | http_body_of | json_string id)"
+  if [ "$status" != "201" ] || [ -z "$ticket" ]; then
+    echo "POST /v1/tickets gave: $out"
+    return 1
+  fi
+  wait_audit_rows 90 "service = 'helpdesk' AND action = 'helpdesk:ticket:create' AND result = 'success' AND actor = 'smoke_helpdesk' AND target_id = '$ticket'" ||
+    { dc logs --tail 20 helpdesk; return 1; }
+}
+
+# S5: the event catalog of the events service has the 5 types of the helpdesk.
+test_helpdesk_event_types() {
+  local token out type
+  token="$(client_token smoke_helpdesk events "events:catalog:read")" || { echo "$token"; return 1; }
+  out="$(net_http events 8080 GET "/v1/event-types?app=helpdesk&pageSize=10" "$token" application/json)"
+  for type in helpdesk.customer.created helpdesk.customer.updated helpdesk.ticket.created \
+    helpdesk.ticket.updated helpdesk.ticket.status_changed; do
+    if ! printf '%s' "$out" | grep -qF "\"$type\""; then
+      echo "the event catalog has no type $type: $out"
+      return 1
+    fi
+  done
+}
+
+# S6: a token with the scope helpdesk:ticket:read only cannot create a ticket. The refusal is in
+# the audit database with the result denied.
+test_helpdesk_denied() {
+  local token out status
+  token="$(client_token smoke_helpdesk helpdesk "helpdesk:ticket:read")" || { echo "$token"; return 1; }
+  out="$(net_http helpdesk 8080 POST /v1/tickets "$token" application/json \
+    '{"subject":"Denied ticket","customerId":"00000000-0000-4000-8000-000000000000"}')"
+  status="$(printf '%s\n' "$out" | http_status_of)"
+  if [ "$status" != "403" ]; then
+    echo "POST /v1/tickets with a read scope gave: $out"
+    return 1
+  fi
+  wait_audit_rows 90 "service = 'helpdesk' AND action = 'helpdesk:ticket:create' AND result = 'denied' AND actor = 'smoke_helpdesk'"
+}
+
+# S7: the log of the helpdesk has no password, no private key, and no token.
+test_helpdesk_no_secret_in_logs() {
+  local logs key_body name
+  check_password_encoding HELPDESK || return 1
+  logs="$(dc logs helpdesk 2>&1)" || return 1
+  key_body="$(sed -n 2p "$key_dir/helpdesk-client-key.pem")"
+  for name in HELPDESK_DB_PASSWORD HELPDESK_DB_PASSWORD_URLENCODED HELPDESK_VALKEY_PASSWORD; do
+    if printf '%s' "$logs" | grep -qF -- "$(envval "$name")"; then
+      echo "the helpdesk log has the value of $name"
+      return 1
+    fi
+  done
+  if printf '%s' "$logs" | grep -qF -e 'PRIVATE KEY' -e "$key_body" -e 'eyJ'; then
+    echo "the helpdesk log has a private key or a token"
+    return 1
+  fi
+}
+
+# S8: the published port of the helpdesk is on 127.0.0.1 (the default of HELPDESK_BIND).
+# The smoke file sets HELPDESK_PORT=0, so Docker picks a free host port.
+test_helpdesk_port() {
+  local mapping
+  mapping="$(dc port helpdesk 8080 | tr -d '\r' | head -n 1)"
+  case "$mapping" in
+    127.0.0.1:*) ;;
+    *) echo "the port mapping is: $mapping"; return 1 ;;
+  esac
+}
+
+# S9: a scope that the client does not have gives invalid_scope.
+test_helpdesk_invalid_scope() {
+  local out
+  if out="$(client_token smoke_helpdesk helpdesk "helpdesk:admin")"; then
+    echo "a token was issued for a scope that the client does not have: $out"
+    return 1
+  fi
+  case "$out" in
+    "token request status 400, error invalid_scope") ;;
+    *) echo "unexpected result: $out"; return 1 ;;
+  esac
+}
+
+make_keys || { echo "FAIL: the keys of identity, events, audit, and helpdesk"; exit 1; }
 
 # Remove a project of an earlier run.
 dc down -v --remove-orphans >/dev/null 2>&1
@@ -1405,6 +1641,14 @@ run_check "I56: no secret in the audit log, password encoding" test_audit_no_sec
 run_check "I57: audit API refuses a request with no token" test_audit_no_token
 run_check "I54: AUDIT_STREAM_READER names another user" test_audit_reader_variable
 run_check "I61: no user can use audit.streams" test_no_audit_streams_access
+run_check "S1: helpdesk is healthy and ready" test_helpdesk_healthy
+run_check "S2: helpdesk Valkey ACL" test_helpdesk_acl
+run_check "S3, S4: helpdesk customer and ticket, audit entry" test_helpdesk_create
+run_check "S5: helpdesk event types in the catalog" test_helpdesk_event_types
+run_check "S6: helpdesk refuses a token with a read scope" test_helpdesk_denied
+run_check "S7: no secret in the helpdesk log" test_helpdesk_no_secret_in_logs
+run_check "S8: helpdesk port is on 127.0.0.1" test_helpdesk_port
+run_check "S9: a scope that the client does not have" test_helpdesk_invalid_scope
 
 if [ "${#failures[@]}" -ne 0 ]; then
   echo "smoke-test: ${#failures[@]} check(s) failed: ${failures[*]}"
