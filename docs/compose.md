@@ -101,7 +101,7 @@ Limit: Loki, Tempo, Prometheus, and the collector have no authentication. A plat
 
 ## Identity
 
-The service `identity` is the identity provider of the platform. It uses the image `ghcr.io/techorionai/constellation-identity:0.9.0`. It uses the database `identity` and the Valkey user `identity` that the provisioning services make from the name `identity` in `CONSTELLATION_SERVICES`.
+The service `identity` is the identity provider of the platform. It uses the image `ghcr.io/techorionai/constellation-identity:0.9.1`. It uses the database `identity` and the Valkey user `identity` that the provisioning services make from the name `identity` in `CONSTELLATION_SERVICES`.
 
 ### Master key
 
@@ -217,7 +217,7 @@ The command prints the link and deletes the earlier unused links. Run it again t
 
 ## Events service
 
-The service `events` is the events service of the platform. It uses the image `ghcr.io/techorionai/constellation-events:0.2.0`, the database `events`, and the Valkey user `events`. It has no published port. Only services on the network `services` call it. Its admin port `9090` is not published.
+The service `events` is the events service of the platform. It uses the image `ghcr.io/techorionai/constellation-events:0.2.1`, the database `events`, and the Valkey user `events`. It has no published port. Only services on the network `services` call it. Its admin port `9090` is not published.
 
 - The events service is the first service client in Compose. It gets tokens from identity with a client key (see "Service clients"). It reads the private key as the Compose secret `events_client_key` from the file `EVENTS_CLIENT_KEY_FILE`.
 - It starts after identity is healthy. It is ready only after it publishes its manifest to identity with a client credentials token. If `readyz` does not give 200, examine `EVENTS_CLIENT_KEY_ID` and the clients file first.
@@ -248,7 +248,7 @@ The service `audit` is the audit service of the platform. It uses the image `ghc
 - The manifest of the audit service has the role `reader`. Identity makes the role `audit:reader`, which gives the permission `audit:log:read`. Give this role to the person or the service that searches and exports audit entries.
 - Pool rule: the service needs `AUDIT_DATABASE__MAX_CONNS` of at least `4 + 2 x AUDIT_EXPORT__CONCURRENCY`. The default concurrency is 2, so the minimum is 8. `compose.yaml` sets `AUDIT_DATABASE__MAX_CONNS` to 8. If you set a higher `AUDIT_EXPORT__CONCURRENCY`, also set a higher `AUDIT_DATABASE__MAX_CONNS`. Else the service stops with a configuration error. The value must stay lower than `SERVICE_DB_CONNECTION_LIMIT`.
 - `AUDIT_HTTP__TRUSTED_PROXIES` stays empty in `compose.yaml`, because the service has no proxy. If a caller that is not a proxy could send forwarded headers, the caller could write a false IP address into its own export entry. If you add a reverse proxy in front of the audit service, set `AUDIT_HTTP__TRUSTED_PROXIES` to the CIDR of the proxy.
-- The images of identity `0.9.0` and events `0.2.0` write audit entries to the Valkey streams `audit.stream:identity` and `audit.stream:events`. See "Audit stream retention".
+- The images of identity `0.9.1` and events `0.2.1` write audit entries to the Valkey streams `audit.stream:identity` and `audit.stream:events`. See "Audit stream retention".
 
 ## Audit stream retention
 
@@ -262,20 +262,16 @@ Identity and events trim their audit stream by age. `compose.yaml` sets `IDENTIT
 
 The text of the selectors is from `constellation-platform-go` `v0.9.0` and decision D12 of `constellation-platform-go#29`. The trusted set `audit.apps` lists the audit apps. Only `provision-valkey` writes it, as the admin user. It registers each name of `CONSTELLATION_SERVICES` and deletes the other names. A producer cannot write `audit.apps`. The reader lists it with `SSCAN` and has no write command. No selector has `+srem`.
 
-`provision-valkey` gives each Valkey user two selectors to write audit entries.
+`provision-valkey` gives each Valkey user one selector to write audit entries. `(~audit.stream:<svc> +xadd +xtrim)` lets a service write and trim only its own audit stream. It is the same as `AuditProducerSelectors(app)`. No selector gives access to the old set `audit.streams`.
 
-- `(~audit.stream:<svc> +xadd +xtrim)` lets a service write and trim only its own audit stream. It is the same as `AuditProducerSelectors(app)`.
-- `(~audit.streams +sadd)` lets a service add its name to the set `audit.streams`. It is for the transition. Identity and events use `constellation-platform-go` `v0.7.0` and send `SADD audit.streams`.
-
-Only the user that `AUDIT_STREAM_READER` names also gets three reader selectors. The default is `audit`.
+Only the user that `AUDIT_STREAM_READER` names also gets two reader selectors. The default is `audit`.
 
 - `(~audit.stream:* +xreadgroup +xack +xautoclaim +xpending +xinfo|groups +xinfo|stream +xinfo|consumers +xgroup|create +xgroup|createconsumer +xgroup|delconsumer +xrange)` lets the reader read and acknowledge entries on each audit stream.
 - `(~audit.apps +sscan)` lets the reader list the trusted set with `SSCAN`. The ACL does not allow `SMEMBERS`.
-- `(~audit.streams +sscan)` is for the transition. No function of the audit service `0.2.0` reads `audit.streams`.
 
 `AUDIT_STREAM_READER` must be in `CONSTELLATION_SERVICES` and must follow the name rule. `provision/valkey.sh` checks this before it changes anything. A service that is not the reader cannot read an audit stream or list the set.
 
-Limits: a producer cannot add a name to `audit.apps`. During the transition, a producer can still add names to `audit.streams`. The names have no effect on the discovery, but they use memory. A later release deletes the two `audit.streams` selectors. `DEL audit.streams` is then an optional manual step. The ACL cannot isolate consumer groups on the audit streams, as on the event streams.
+Limits: a producer cannot add a name to `audit.apps`. No producer can write `audit.streams`, so a producer cannot use Valkey memory through that set. An older set `audit.streams` can stay in Valkey after the upgrade to `v0.6.0`. See "Upgrade from v0.5.0 to v0.6.0" for the optional delete. The ACL cannot isolate consumer groups on the audit streams, as on the event streams.
 
 An existing install gets the selectors after `docker compose run --rm provision-valkey`.
 
@@ -313,7 +309,7 @@ Backup: keep a copy of the folder `secrets/`. It has the master key of identity,
 Two one-shot services make the objects. They are idempotent. A second run gives the same result.
 
 - `provision-postgres` makes the role `<svc>` and the database `<svc>` with the role as owner. It removes the `CONNECT` permission of `PUBLIC` and gives it to the role. A service cannot connect to the database of another service. The script also removes `CONNECT` and `TEMP` of `PUBLIC` on the databases `postgres` and `template1`, and it sets `CONNECTION LIMIT` of each role to `SERVICE_DB_CONNECTION_LIMIT`.
-- `provision-valkey` makes the ACL user `<svc>`. The user can use the keys `<svc>:*` and the commands `+@all -@admin -@dangerous -@scripting -function -scan -randomkey -dbsize -memory`. Valkey does not filter `SCAN`, `RANDOMKEY`, `DBSIZE`, and `MEMORY` by key pattern, so they would show the key names of other services. A script (`EVAL`) can block Valkey for all services, so scripts are off. Each user also has two selectors for the event streams (see "Event stream ACL") and two selectors for the audit streams (see "Audit stream ACL"). The reader user has three more. The script registers each service in the set `audit.apps` (see "Audit stream ACL"). The script saves the users to the ACL file in the `valkey-data` volume, so they stay after a restart. The ACL file has the SHA-256 hash of each password, not the password. When you delete a name from `CONSTELLATION_SERVICES`, `provision-valkey` deletes it from `audit.apps`. The ACL user of the name stays.
+- `provision-valkey` makes the ACL user `<svc>`. The user can use the keys `<svc>:*` and the commands `+@all -@admin -@dangerous -@scripting -function -scan -randomkey -dbsize -memory`. Valkey does not filter `SCAN`, `RANDOMKEY`, `DBSIZE`, and `MEMORY` by key pattern, so they would show the key names of other services. A script (`EVAL`) can block Valkey for all services, so scripts are off. Each user also has two selectors for the event streams (see "Event stream ACL") and one selector for the audit streams (see "Audit stream ACL"). The reader user has two more. The script registers each service in the set `audit.apps` (see "Audit stream ACL"). The script saves the users to the ACL file in the `valkey-data` volume, so they stay after a restart. The ACL file has the SHA-256 hash of each password, not the password. When you delete a name from `CONSTELLATION_SERVICES`, `provision-valkey` deletes it from `audit.apps`. The ACL user of the name stays.
 
 The scripts do not print passwords, and they do not put passwords on a command line. The scripts reject the placeholder `change-me`, a password with fewer than 12 characters, and a Valkey password with white space, before they change anything. Services connect to PostgreSQL directly. Do not put a pooler in transaction mode between them, because it breaks the advisory locks of the migrations.
 
@@ -323,7 +319,7 @@ The scripts do not print passwords, and they do not put passwords on a command l
 2. Add `<SVC>_DB_PASSWORD` and `<SVC>_VALKEY_PASSWORD` to `.env`.
 3. If the service gets tokens from identity, run `bash scripts/new-service-client.sh <svc> [role ...]` and follow the steps that it prints (see "Service clients").
 4. Add a service block to `compose.yaml` (the template below). The `events` block is an example of a service client.
-5. A new service gets 4 selectors: two for event streams and two for audit streams. `provision-valkey` registers the new service in `audit.apps`. The audit service does not find a service that is not registered, so run `provision-valkey` before the service starts. Only the user that `AUDIT_STREAM_READER` names reads audit streams. Do not name a new service as the reader.
+5. A new service gets 3 selectors: two for event streams and one for audit streams. A custom producer must use `constellation-platform-go` `v0.9.0` or later. An older producer logs a warning for each `SADD audit.streams`, because no user can write that set. `provision-valkey` registers the new service in `audit.apps`. The audit service does not find a service that is not registered, so run `provision-valkey` before the service starts. Only the user that `AUDIT_STREAM_READER` names reads audit streams. Do not name a new service as the reader.
 6. Run the provisioning services: `docker compose run --rm provision-postgres` and `docker compose run --rm provision-valkey`. Then run `docker compose up -d`. Use `docker compose run --rm` because `docker compose up -d` does not start an exited one-shot container again when its configuration did not change.
 
 Template for a service `identity`. Use the exact version tag of the image in place of `<version>` (for example `0.1.0`). Replace `identity` and `IDENTITY` with the name of the service. URL-encode the password in `DATABASE__URL`. A platform service joins the `services` network only. Add the same hardening as the base services.
@@ -406,7 +402,7 @@ Valkey runs with AOF (`appendonly yes`) and `maxmemory-policy noeviction`. Strea
 Sizing rules for `VALKEY_MAXMEMORY`:
 
 - Valkey holds the event streams, the audit streams, the login counters, the authorization codes, and the rate limit keys. When the memory is full, all writes of all services fail.
-- Audit streams: plan for the audit entries of `AUDIT_STREAM_RETENTION` (see "Audit stream retention"). A denied token entry is approximately 1 KB. Identity `0.9.0` limits them. Denied token entries: approximately `(R / 24 + 1) x TOKEN_DENIED_GLOBAL limit x 1 KB`. `R` is the longer of `AUDIT_STREAM_RETENTION` and the longest stop of the audit service, in hours. With the default limit 100000 and `R` = 24, this is approximately 200 MB. Add approximately `(R / 24 + 1) x 14400 x 1 KB` (approximately 14 MB for `R` = 24) for each registered client, for the bucket `token_denied_client`. Add approximately 4800 denied login entries (approximately 5 MB) for each IP that you expect in 24 hours. Add approximately 2 MB of rate limit keys for each IPv6 /48 prefix. When the rate limits are off, the denied token bound is for each replica. Add a rate limit in the reverse proxy. When the memory is full, `provision-valkey` cannot register a new service.
+- Audit streams: plan for the audit entries of `AUDIT_STREAM_RETENTION` (see "Audit stream retention"). A denied token entry is approximately 1 KB. Identity `0.9.1` limits them. Denied token entries: approximately `(R / 24 + 1) x TOKEN_DENIED_GLOBAL limit x 1 KB`. `R` is the longer of `AUDIT_STREAM_RETENTION` and the longest stop of the audit service, in hours. With the default limit 100000 and `R` = 24, this is approximately 200 MB. Add approximately `(R / 24 + 1) x 14400 x 1 KB` (approximately 14 MB for `R` = 24) for each registered client, for the bucket `token_denied_client`. Add approximately 4800 denied login entries (approximately 5 MB) for each IP that you expect in 24 hours. Add approximately 2 MB of rate limit keys for each IPv6 /48 prefix. When the rate limits are off, the denied token bound is for each replica. Add a rate limit in the reverse proxy. When the memory is full, `provision-valkey` cannot register a new service.
 - Use the longer of `AUDIT_STREAM_RETENTION` and the longest stop of the audit service. Do not make it shorter to save memory.
 - Add the memory of the event streams and the other keys. Then add at least 25 percent of free memory. The AOF rewrite also needs memory.
 - Watch `used_memory` and `maxmemory` in the metrics. Raise `VALKEY_MAXMEMORY` before `used_memory` is at 80 percent of it.
@@ -503,6 +499,31 @@ The release `v0.5.0` adds the trusted set `audit.apps`, identity `0.9.0`, and au
 
 If step 5 comes before step 4, the audit service gets `NOPERM` on `SSCAN audit.apps` and counts `apps_error`. It finds no new producer. The table `known_apps` keeps the intake of the known apps. The fix is step 4.
 
-A later release deletes the `audit.streams` selectors. `DEL audit.streams` is then an optional manual step. Before that release, producers with the transition selectors write `audit.streams` again, so a delete has no lasting effect.
+The release `v0.6.0` deletes the transition selectors. See "Upgrade from v0.5.0 to v0.6.0".
 
 Identity `0.9.0` limits the denied token entries. See "Audit stream retention" and "Valkey" for the buckets, the counter, and the new sizing rule.
+
+## Upgrade from v0.5.0 to v0.6.0
+
+The release `v0.6.0` uses identity `0.9.1` and events `0.2.1`. Both images use `constellation-platform-go` `v0.9.0`. They write only the streams `audit.stream:<app>`. The release deletes the two transition selectors for the set `audit.streams` from each Valkey user. A custom producer must use `constellation-platform-go` `v0.9.0` or later before you upgrade. An older producer logs a warning for each `SADD audit.streams`. Do these steps in this order:
+
+1. Make a backup of the databases and of the folder `secrets/`.
+2. Get the files of the release `v0.6.0`.
+3. Run `docker compose pull`.
+4. Run `docker compose run --rm provision-valkey`. Each run replaces all selectors of each user. Identity `0.9.0` and events `0.2.0` still run until step 5. They log the warning `streams: cannot add the app to the audit index`. This warning is normal. No audit entry is lost.
+5. Run `docker compose up -d`. This starts identity `0.9.1` and events `0.2.1`.
+6. As the admin user, run these checks. `<reader>` is the user that `AUDIT_STREAM_READER` names (default `audit`).
+   - `ACL DRYRUN <svc> SADD audit.streams x` returns a text that has `no permissions` for each service.
+   - `ACL DRYRUN <reader> SSCAN audit.streams 0` returns a text that has `no permissions`.
+7. Optional: as the admin user, run `DEL audit.streams`. The set has no effect on the discovery, and no service user can write it again. The delete has a lasting effect after this release.
+
+Use the identity and events images of this release. Older producers log a warning for each `SADD audit.streams`.
+
+### Roll back to v0.5.0
+
+1. Get the files of the release `v0.5.0`.
+2. Run `docker compose pull`.
+3. Run `docker compose run --rm provision-valkey`. The script of `v0.5.0` gives the transition selectors again.
+4. Run `docker compose up -d`.
+
+A previous `DEL audit.streams` has no effect on the discovery, because the audit image `0.2.0` reads only `audit.apps`.
