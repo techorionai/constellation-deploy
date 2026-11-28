@@ -64,6 +64,20 @@ while IFS= read -r -d '' file; do
   fi
 done < <(cd "$repo_root" && git ls-files -z '*.sh')
 
+# U5: an env file with no POSTGRES_MAX_CONNECTIONS gives the default max_connections=250.
+tmp="$(mktemp -d)"
+grep -v '^POSTGRES_MAX_CONNECTIONS=' "$repo_root/tests/smoke.env" > "$tmp/env"
+if (cd "$repo_root" && CONSTELLATION_ENV_FILE="$tmp/env" \
+  HELPDESK_CLIENT_KEY_FILE=./k IDENTITY_MASTER_KEY_FILE=./k EVENTS_CLIENT_KEY_FILE=./k AUDIT_CLIENT_KEY_FILE=./k \
+  docker compose --env-file "$tmp/env" config 2>&1) | grep -qF 'max_connections=250'; then
+  echo "ok: U5: default max_connections"
+else
+  echo "FAIL: U5: the default of POSTGRES_MAX_CONNECTIONS is not 250"
+  failed=1
+fi
+rm -rf "$tmp"
+tmp=""
+
 if [ "$failed" -ne 0 ]; then
   exit 1
 fi

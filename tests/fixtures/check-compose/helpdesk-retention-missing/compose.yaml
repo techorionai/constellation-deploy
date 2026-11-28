@@ -1,0 +1,5 @@
+services:
+  helpdesk:
+    image: ghcr.io/techorionai/constellation-helpdesk:0.1.0
+    environment:
+      HELPDESK_CLIENT__ID: helpdesk

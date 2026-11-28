@@ -105,6 +105,16 @@ else
   fail "U6: duplicate id" "$out"
 fi
 
+# Issue 25, U6: two roles for the client smoke_helpdesk give one clients file entry with both roles.
+d25="$(fresh)"
+if out="$(run "$d25" --secrets-dir s --clients-file s/identity-clients.yaml smoke_helpdesk helpdesk:support_agent events:reader)" \
+  && [ "$(grep -c '^  - id: ' "$d25/s/identity-clients.yaml")" = "1" ] \
+  && grep -qF 'roles: [helpdesk:support_agent, events:reader]' "$d25/s/identity-clients.yaml"; then
+  pass "U6 (issue 25): two roles for smoke_helpdesk"
+else
+  fail "U6 (issue 25): two roles for smoke_helpdesk" "$out"
+fi
+
 # U7: bad roles are refused. No file is made.
 d="$(fresh)"
 ok=1
