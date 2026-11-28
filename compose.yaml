@@ -373,7 +373,7 @@ services:
 
   helpdesk:
     <<: *hardened
-    image: ghcr.io/techorionai/constellation-helpdesk:0.1.0
+    image: ghcr.io/techorionai/constellation-helpdesk:0.2.0
     restart: unless-stopped
     read_only: true
     depends_on:
@@ -397,6 +397,10 @@ services:
       HELPDESK_VALKEY__KEY_PREFIX: helpdesk
       # CIDR list of the reverse proxies in front of the helpdesk. Empty means no proxy.
       HELPDESK_HTTP__TRUSTED_PROXIES: ${HELPDESK_TRUSTED_PROXIES:-}
+      # The public base URL of the helpdesk. The MCP resource URL and the link templates use it. See docs/compose.md.
+      HELPDESK_PUBLIC_BASE_URL: ${HELPDESK_PUBLIC_BASE_URL:?set HELPDESK_PUBLIC_BASE_URL in .env}
+      # Origins that the MCP endpoint accepts. Empty means only requests with no Origin header.
+      HELPDESK_MCP__ALLOWED_ORIGINS: ${HELPDESK_MCP_ALLOWED_ORIGINS:-}
       # The service client of the helpdesk. The private key is the Compose secret
       # helpdesk_client_key. The key ID and the key path are not secrets.
       HELPDESK_CLIENT__ID: helpdesk
