@@ -1612,7 +1612,9 @@ test_mcp_audit() {
 }
 
 mcp_event_in_stream() {
-  vk_admin XRANGE events.stream:helpdesk - + 2>&1 | tr -d '\r' | grep -qF "tickets/$mcp_ticket_id"
+  # One entry is one line with the type and the subject, so both must be on the same line.
+  vk_admin XRANGE events.stream:helpdesk - + 2>&1 | tr -d '\r' |
+    grep -F "\"type\": \"helpdesk.ticket.created\"" | grep -qF "\"subject\": \"tickets/$mcp_ticket_id\""
 }
 
 # M3: the event stream of the helpdesk has the event of the MCP ticket.
@@ -1620,52 +1622,81 @@ test_mcp_event() {
   mcp_ticket_id="$(cat "$key_dir/mcp-ticket-id" 2>/dev/null)"
   [ -n "$mcp_ticket_id" ] || { echo "M1 made no ticket"; return 1; }
   if ! poll 90 mcp_event_in_stream; then
-    echo "no event with the subject tickets/$mcp_ticket_id in events.stream:helpdesk"
+    echo "no event of the type helpdesk.ticket.created with the subject tickets/$mcp_ticket_id in events.stream:helpdesk"
+    vk_admin XRANGE events.stream:helpdesk - + 2>&1 | tr -d '\r' | tail -n 12
     return 1
   fi
-  vk_admin XRANGE events.stream:helpdesk - + | grep -qF "helpdesk.ticket.created" ||
-    { echo "no event of the type helpdesk.ticket.created"; return 1; }
 }
 
 # M4: the event catalog has the type helpdesk.ticket.created with a data schema.
 test_mcp_catalog() {
-  local token out
+  local token out item
   token="$(client_token smoke_helpdesk events "events:catalog:read")" || { echo "$token"; return 1; }
+  # The maximum of pageSize is 10 and the helpdesk has 5 types, so one page has all types.
   out="$(net_http events 8080 GET "/v1/event-types?app=helpdesk&pageSize=10" "$token" application/json)"
-  printf '%s' "$out" | grep -qF '"helpdesk.ticket.created"' || { echo "the catalog has no helpdesk.ticket.created: $out"; return 1; }
-  printf '%s' "$out" | grep -q '"dataSchema"' || { echo "the catalog has no dataSchema: $out"; return 1; }
+  [ "$(printf '%s\n' "$out" | http_status_of)" = "200" ] || { echo "the event catalog gave: $out"; return 1; }
+  # Put each item of the catalog on its own line, then take the item of the type. The data schema
+  # must be in the same item as the type.
+  item="$(printf '%s\n' "$out" | http_body_of | sed 's/{"app":"helpdesk"/\n&/g' | grep -F '"type":"helpdesk.ticket.created"')"
+  [ -n "$item" ] || { echo "the catalog has no helpdesk.ticket.created: $out"; return 1; }
+  printf '%s' "$item" | grep -q '"dataSchema":{' || { echo "the item helpdesk.ticket.created has no dataSchema: $item"; return 1; }
 }
 
-# M5: a token with the scope helpdesk:ticket:read only gets 403 with insufficient_scope on create_ticket.
-# The audit database has the denied entry with the channel mcp.
+# The header lines of the output of mcp_raw (up to the empty line).
+http_headers_of() {
+  sed '/^$/q'
+}
+
+# M5: a token with the scope helpdesk:ticket:read only gets 403 with insufficient_scope in the header
+# WWW-Authenticate on each write tool. The audit database has the denied entry of create_ticket with
+# the channel mcp.
 test_mcp_denied() {
-  local token out
+  local token out zero="00000000-0000-4000-8000-000000000000" tool args
   token="$(client_token smoke_helpdesk helpdesk "helpdesk:ticket:read")" || { echo "$token"; return 1; }
-  out="$(mcp_call "$token" create_ticket '{"subject":"Denied MCP ticket","customerId":"00000000-0000-4000-8000-000000000000"}')"
-  [ "$(printf '%s\n' "$out" | http_status_of)" = "403" ] || { echo "create_ticket with a read scope gave: $out"; return 1; }
-  printf '%s' "$out" | grep -qi 'insufficient_scope' || { echo "no insufficient_scope in: $out"; return 1; }
+  for tool in create_ticket update_ticket create_customer update_customer; do
+    case "$tool" in
+      create_ticket) args="{\"subject\":\"Denied MCP ticket\",\"customerId\":\"$zero\"}" ;;
+      update_ticket) args="{\"ticketId\":\"$zero\",\"subject\":\"Denied\"}" ;;
+      create_customer) args='{"name":"Denied MCP Customer","email":"smoke-mcp-denied@example.com"}' ;;
+      update_customer) args="{\"customerId\":\"$zero\",\"name\":\"Denied\"}" ;;
+    esac
+    out="$(mcp_call "$token" "$tool" "$args")"
+    [ "$(printf '%s\n' "$out" | http_status_of)" = "403" ] || { echo "$tool with a read scope gave: $out"; return 1; }
+    printf '%s\n' "$out" | http_headers_of | grep -qi '^www-authenticate:.*insufficient_scope' ||
+      { echo "$tool: no insufficient_scope in the header WWW-Authenticate: $out"; return 1; }
+  done
   wait_audit_rows 90 "service = 'helpdesk' AND action = 'helpdesk:ticket:create' AND result = 'denied' AND actor = 'smoke_helpdesk' AND details->>'channel' = 'mcp'"
 }
 
-# M6: tools/list has 9 tools. Each tool has the required scopes in _meta.
+# M6: tools/list has 9 tools. Each tool has its scope of the tools table of helpdesk#3 in _meta.
 test_mcp_tools() {
-  local token out count want
-  token="$(client_token smoke_helpdesk helpdesk "helpdesk:ticket:read")" || { echo "$token"; return 1; }
+  local token out count pair tool scope items
+  token="$(client_token smoke_helpdesk helpdesk "helpdesk:customer:write helpdesk:ticket:write helpdesk:ticket:read")" ||
+    { echo "$token"; return 1; }
   out="$(mcp_raw "$token" tools/list "" "")"
   [ "$(printf '%s\n' "$out" | http_status_of)" = "200" ] || { echo "tools/list gave: $out"; return 1; }
   count="$(printf '%s' "$out" | grep -o '"name" *: *"[a-z_]*"' | grep -c -E '"(list|get|lookup|create|update)_(customers?|tickets?)"')"
   [ "$count" = "9" ] || { echo "tools/list has $count tools, not 9: $out"; return 1; }
   count="$(printf '%s' "$out" | grep -o 'ai\.techorion\.constellation/requiredScopes' | wc -l | tr -d ' ')"
   [ "$count" = "9" ] || { echo "$count tools have requiredScopes, not 9: $out"; return 1; }
-  for want in '"helpdesk:customer:read"' '"helpdesk:customer:write"' '"helpdesk:ticket:read"' '"helpdesk:ticket:write"'; do
-    printf '%s' "$out" | grep -qF "$want" || { echo "no scope $want in: $out"; return 1; }
+  # Put each tool on its own line. The _meta field is the first field of a tool.
+  items="$(printf '%s' "$out" | sed 's/{"_meta":{"ai\.techorion/\n&/g')"
+  for pair in list_customers:helpdesk:customer:read get_customer:helpdesk:customer:read \
+    lookup_customer:helpdesk:customer:read create_customer:helpdesk:customer:write \
+    update_customer:helpdesk:customer:write list_tickets:helpdesk:ticket:read \
+    get_ticket:helpdesk:ticket:read create_ticket:helpdesk:ticket:write update_ticket:helpdesk:ticket:write; do
+    tool="${pair%%:*}"
+    scope="${pair#*:}"
+    printf '%s\n' "$items" | grep -F "/requiredScopes\":[\"$scope\"]" | grep -qF "\"name\":\"$tool\"" ||
+      { echo "the tool $tool has not the only scope $scope: $out"; return 1; }
   done
 }
 
 # M7: the link templates resource has the base URL and the two templates.
 test_mcp_link_templates() {
   local token out want
-  token="$(client_token smoke_helpdesk helpdesk "helpdesk:ticket:read")" || { echo "$token"; return 1; }
+  token="$(client_token smoke_helpdesk helpdesk "helpdesk:customer:write helpdesk:ticket:write helpdesk:ticket:read")" ||
+    { echo "$token"; return 1; }
   out="$(mcp_raw "$token" resources/read "constellation://helpdesk/link-templates" "\"uri\":\"constellation://helpdesk/link-templates\"")"
   [ "$(printf '%s\n' "$out" | http_status_of)" = "200" ] || { echo "resources/read gave: $out"; return 1; }
   # The resource content is a JSON text in a string, so each quote has a backslash.
@@ -1687,6 +1718,19 @@ test_mcp_no_token() {
   [ "$(printf '%s\n' "$out" | http_status_of)" = "200" ] || { echo "metadata gave: $out"; return 1; }
   printf '%s' "$out" | tr -d ' ' | grep -qF "\"resource\":\"$base/mcp\"" || { echo "wrong resource in: $out"; return 1; }
   printf '%s' "$out" | tr -d ' ' | grep -qF "\"$(envval IDENTITY_ISSUER)\"" || { echo "wrong authorization_servers in: $out"; return 1; }
+}
+
+# M9: /mcp refuses a token for another audience. The audit database gets no new MCP entry for the call.
+test_mcp_audience() {
+  local token out before after cond
+  cond="service = 'helpdesk' AND action = 'helpdesk:ticket:create' AND details->>'channel' = 'mcp'"
+  token="$(client_token smoke_helpdesk events "events:catalog:read")" || { echo "$token"; return 1; }
+  before="$(audit_count "$cond")"
+  out="$(mcp_call "$token" create_ticket '{"subject":"Wrong audience MCP ticket","customerId":"00000000-0000-4000-8000-000000000000"}')"
+  [ "$(printf '%s\n' "$out" | http_status_of)" = "401" ] || { echo "a token for the audience events gave: $out"; return 1; }
+  sleep 5
+  after="$(audit_count "$cond")"
+  [ "$before" = "$after" ] || { echo "the audit entries of the MCP channel changed from $before to $after"; return 1; }
 }
 
 make_keys || { echo "FAIL: the keys of identity, events, audit, and helpdesk"; exit 1; }
@@ -1796,6 +1840,8 @@ run_check "M5: MCP refuses a token with a read scope" test_mcp_denied
 run_check "M6: MCP tools and required scopes" test_mcp_tools
 run_check "M7: MCP link templates resource" test_mcp_link_templates
 run_check "M8: MCP refuses no token, metadata is public" test_mcp_no_token
+run_check "M9: MCP refuses a token for another audience" test_mcp_audience
+run_check "M10: no secret in the helpdesk log after the MCP checks" test_helpdesk_no_secret_in_logs
 
 if [ "${#failures[@]}" -ne 0 ]; then
   echo "smoke-test: ${#failures[@]} check(s) failed: ${failures[*]}"

@@ -64,6 +64,23 @@ while IFS= read -r -d '' file; do
   fi
 done < <(cd "$repo_root" && git ls-files -z '*.sh')
 
+# U3: an env file with no HELPDESK_PUBLIC_BASE_URL stops docker compose config. The error names the variable.
+tmp="$(mktemp -d)"
+grep -v '^HELPDESK_PUBLIC_BASE_URL=' "$repo_root/tests/smoke.env" > "$tmp/env"
+u3_output="$(cd "$repo_root" && \
+  HELPDESK_CLIENT_KEY_FILE=./k IDENTITY_MASTER_KEY_FILE=./k EVENTS_CLIENT_KEY_FILE=./k AUDIT_CLIENT_KEY_FILE=./k \
+  docker compose --env-file "$tmp/env" config 2>&1)"
+u3_code=$?
+if [ "$u3_code" -ne 0 ] && printf '%s\n' "$u3_output" | grep -qF 'HELPDESK_PUBLIC_BASE_URL'; then
+  echo "ok: U3: no HELPDESK_PUBLIC_BASE_URL stops docker compose config"
+else
+  echo "FAIL: U3: expected a failure that names HELPDESK_PUBLIC_BASE_URL, got exit code $u3_code"
+  echo "$u3_output"
+  failed=1
+fi
+rm -rf "$tmp"
+tmp=""
+
 # U5: an env file with no POSTGRES_MAX_CONNECTIONS gives the default max_connections=250.
 tmp="$(mktemp -d)"
 grep -v '^POSTGRES_MAX_CONNECTIONS=' "$repo_root/tests/smoke.env" > "$tmp/env"
