@@ -69,6 +69,8 @@ All settings are in `.env`. Compose reads `.env` in the project folder. The vari
 | `HELPDESK_CLIENT_KEY_FILE`, `HELPDESK_CLIENT_KEY_ID` | none | Path of the client key file of the helpdesk on the host, and the ID of the key. The ID is not a secret. |
 | `HELPDESK_BIND`, `HELPDESK_PORT` | `127.0.0.1`, `8081` | Host IP and host port of the helpdesk. Keep the bind on loopback unless a TLS reverse proxy runs on the same host. |
 | `HELPDESK_TRUSTED_PROXIES` | empty | CIDR list of the reverse proxies in front of the helpdesk. Set it when you use a proxy (see "Helpdesk service"). |
+| `HELPDESK_PUBLIC_BASE_URL` | none | Public URL of the helpdesk, for example `http://localhost:8081`. It has no path and no `/` at the end. A host other than `localhost` needs `https://`. The MCP resource URL and the link templates use it. |
+| `HELPDESK_MCP_ALLOWED_ORIGINS` | empty | Origins that the MCP endpoint accepts, with a comma between them. Server clients send no `Origin` header, so the empty value is correct for them. |
 | `AUDIT_STREAM_READER` | `audit` | The one service user that reads the audit streams (see "Audit stream ACL"). It must be in `CONSTELLATION_SERVICES`. |
 | `IDENTITY_BIND`, `IDENTITY_PORT` | `127.0.0.1`, `8080` | Host IP and host port of identity. Keep the bind on loopback unless a TLS reverse proxy runs on the same host. |
 | `IDENTITY_TRUSTED_PROXIES` | empty | CIDR list of the reverse proxies in front of identity. Set it when you use a proxy (see "Identity"). |
@@ -257,7 +259,7 @@ The service `audit` is the audit service of the platform. It uses the image `ghc
 
 ## Helpdesk service
 
-The service `helpdesk` keeps customers and tickets. It uses the image `ghcr.io/techorionai/constellation-helpdesk:0.1.0`, the database `helpdesk`, and the Valkey user `helpdesk`. It publishes its API port `8080` as `${HELPDESK_BIND:-127.0.0.1}:${HELPDESK_PORT:-8081}`. The admin port `9090` is not published.
+The service `helpdesk` keeps customers and tickets. It uses the image `ghcr.io/techorionai/constellation-helpdesk:0.2.0`, the database `helpdesk`, and the Valkey user `helpdesk`. It publishes its API port `8080` as `${HELPDESK_BIND:-127.0.0.1}:${HELPDESK_PORT:-8081}`. The admin port `9090` is not published.
 
 - The helpdesk is a service client, as the events service is (see "Service clients"). Make its key with `bash scripts/new-service-client.sh helpdesk events:producer`. The role `events:producer` lets the helpdesk register its event types. The helpdesk reads the private key as the Compose secret `helpdesk_client_key` from the file `HELPDESK_CLIENT_KEY_FILE`.
 - It starts after identity and events are healthy. It is ready only after it publishes its event types and its manifest to the events service. If `readyz` does not give 200, examine `HELPDESK_CLIENT_KEY_ID` and the clients file first.
@@ -267,7 +269,11 @@ The service `helpdesk` keeps customers and tickets. It uses the image `ghcr.io/t
 - `HELPDESK_TRUSTED_PROXIES` is the CIDR list of the reverse proxies in front of the helpdesk. If you use a proxy and do not set it, the helpdesk sees the address of the proxy as the client address of all callers, and the audit entries have the proxy address. Each trusted proxy must append the address of its peer to `X-Forwarded-For`.
 - Keep `HELPDESK_BIND` on `127.0.0.1` unless a TLS reverse proxy runs on the same host. With `HELPDESK_BIND=0.0.0.0`, the helpdesk serves plain HTTP on all interfaces, and tokens go on the network in plain text. A port that Docker publishes also bypasses host firewalls such as `ufw`.
 - The helpdesk pool has 8 connections (`HELPDESK_DATABASE__MAX_CONNS`). The role limit is `SERVICE_DB_CONNECTION_LIMIT`.
-- The smoke test makes the client `smoke_helpdesk` with the roles `helpdesk:support_agent` and `events:reader`. It gets a token with a `private_key_jwt` assertion and creates a customer and a ticket. Then it examines the audit entry in the audit database and the event types in the event catalog.
+- The helpdesk has an MCP server. The endpoint is `POST /mcp` on the helpdesk port. The metadata of the protected resource is at `GET /.well-known/oauth-protected-resource/mcp`. A client asks identity for a token with the parameter `audience=helpdesk`. Identity does not support the RFC 8707 parameter `resource`. The tools check the scopes of the token. A token with too few scopes gives 403 with the code `insufficient_scope`.
+- `HELPDESK_PUBLIC_BASE_URL` is required. An install that is not local must use an `https://` address with no path and no `/` at the end. The helpdesk does not start with a value that breaks this rule.
+- `HELPDESK_MCP_ALLOWED_ORIGINS` is empty by default. A request with no `Origin` header is always accepted. Server clients send no `Origin` header.
+- Bifrost settings (roadmap item R20): set the connection type to Streamable HTTP and the URL to `<HELPDESK_PUBLIC_BASE_URL>/mcp`. Set `auth_type` to `none` and `allowed_extra_headers` to `["authorization"]`. Bifrost then sends the `Authorization` header of the caller to the helpdesk. Callers must authenticate to Bifrost with its own header, for example `x-bf-vk`. Never put a Bifrost key in `Authorization`, because the key goes to the helpdesk. Only a helpdesk token with the audience `helpdesk` goes in `Authorization: Bearer <token>`.
+- The smoke test makes the client `smoke_helpdesk` with the roles `helpdesk:support_agent` and `events:reader`. It gets a token with a `private_key_jwt` assertion and creates a customer and a ticket with the REST API and with the MCP endpoint (checks M1 to M10). Then it examines the audit entry in the audit database and the event types in the event catalog.
 
 ## Audit stream retention
 
@@ -521,6 +527,22 @@ If step 5 comes before step 4, the audit service gets `NOPERM` on `SSCAN audit.a
 The release `v0.6.0` deletes the transition selectors. See "Upgrade from v0.5.0 to v0.6.0".
 
 Identity `0.9.0` limits the denied token entries. See "Audit stream retention" and "Valkey" for the buckets, the counter, and the new sizing rule.
+
+## Upgrade from v0.7.0 to v0.8.0
+
+The release `v0.8.0` changes the helpdesk image from `0.1.0` to `0.2.0`. The new version has an MCP server. It needs the new variable `HELPDESK_PUBLIC_BASE_URL`. Do these steps in this order:
+
+1. Make a backup of the databases and of the folder `secrets/`.
+2. Get the files of the release `v0.8.0`.
+3. In `.env`, add `HELPDESK_PUBLIC_BASE_URL`. See "Helpdesk service" for the rule. Until the variable exists, each Compose command stops with an error that names the variable. Optional: `HELPDESK_MCP_ALLOWED_ORIGINS`.
+4. Run `docker compose pull`.
+5. Run `docker compose up -d`. This starts the helpdesk `0.2.0`.
+6. Examine the states with `docker compose ps`. The service `helpdesk` shows `healthy`.
+
+### Roll back to v0.7.0
+
+1. Get the files of the release `v0.7.0`.
+2. Run `docker compose up -d`. The helpdesk `0.1.0` ignores the new variables. The helpdesk `0.2.0` made no database change that `0.1.0` cannot read. Read the release notes of the helpdesk before you roll back.
 
 ## Upgrade from v0.6.0 to v0.7.0
 
