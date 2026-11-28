@@ -1511,9 +1511,10 @@ test_helpdesk_denied() {
 # S7: the log of the helpdesk has no password, no private key, and no token.
 test_helpdesk_no_secret_in_logs() {
   local logs key_body name
+  check_password_encoding HELPDESK || return 1
   logs="$(dc logs helpdesk 2>&1)" || return 1
   key_body="$(sed -n 2p "$key_dir/helpdesk-client-key.pem")"
-  for name in HELPDESK_DB_PASSWORD HELPDESK_VALKEY_PASSWORD; do
+  for name in HELPDESK_DB_PASSWORD HELPDESK_DB_PASSWORD_URLENCODED HELPDESK_VALKEY_PASSWORD; do
     if printf '%s' "$logs" | grep -qF -- "$(envval "$name")"; then
       echo "the helpdesk log has the value of $name"
       return 1

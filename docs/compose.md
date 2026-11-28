@@ -539,8 +539,11 @@ The release `v0.7.0` adds the helpdesk service `0.1.0`. It also changes the defa
 ### Roll back to v0.6.0
 
 1. Get the files of the release `v0.6.0`.
-2. Remove the helpdesk variables from `.env` if you want. The database `helpdesk` and the Valkey user `helpdesk` stay.
-3. Run `docker compose up -d --remove-orphans`.
+2. Remove the entry `helpdesk` from `secrets/identity-clients.yaml`. Delete the key file `secrets/helpdesk-client-key.pem`. Restart identity with `docker compose restart identity`. Identity reads the clients file only at the start. Until the restart, the helpdesk client can still get tokens.
+3. As the admin user of Valkey, run `ACL DELUSER helpdesk` and `SREM audit.apps helpdesk`. Then run `ACL SAVE`. The Valkey user can otherwise still write to `audit.stream:helpdesk` and `events.stream:helpdesk`.
+4. In `.env`, remove `helpdesk` from `CONSTELLATION_SERVICES`. Remove `HELPDESK_DB_PASSWORD`, `HELPDESK_DB_PASSWORD_URLENCODED`, `HELPDESK_VALKEY_PASSWORD`, `HELPDESK_CLIENT_KEY_FILE`, and `HELPDESK_CLIENT_KEY_ID`. Remove the other helpdesk variables.
+5. Run `docker compose up -d --remove-orphans`.
+6. Optional: to remove the data, drop the database `helpdesk` and the role `helpdesk` in PostgreSQL. Do a backup first. To keep the data and block access, run `ALTER ROLE helpdesk NOLOGIN`.
 
 ## Upgrade from v0.5.0 to v0.6.0
 
