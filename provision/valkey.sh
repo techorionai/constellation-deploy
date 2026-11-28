@@ -101,23 +101,20 @@ expect_ok() {
 # The first selector lets the service write and trim only its own stream. The second selector
 # lets the service read, ack, and claim on every stream. The ACL cannot isolate consumer groups.
 #
-# Each user also gets two selectors to write audit entries. The first is the same as
-# AuditProducerSelectors(app) of platform-go v0.9.0. The second selector is for the transition
-# of decision D12 of platform-go#29: identity and events use platform-go v0.7.0 and send
-# SADD audit.streams. The user that AUDIT_STREAM_READER names
-# also gets the selectors of AuditReaderSelectors() of v0.9.0, and the old selector
-# "(~audit.streams +sscan)" for the transition. Only this user reads audit streams.
+# Each user also gets one selector to write audit entries. It is the same as
+# AuditProducerSelectors(app) of platform-go v0.9.0. The user that AUDIT_STREAM_READER names
+# also gets the selectors of AuditReaderSelectors() of v0.9.0. Only this user reads audit streams.
 # The reader lists the set "audit.apps" with SSCAN, not SMEMBERS. No selector has +srem.
-# A later release deletes the two audit.streams selectors, when all producers use v0.9.0.
+# No selector gives access to the old set audit.streams.
 # Each selector is in quotes, because valkey-cli splits the rule at spaces.
 provision() {
   svc="$1"
   upper=$(printf '%s' "$svc" | tr '[:lower:]' '[:upper:]')
   pw=$(printenv "${upper}_VALKEY_PASSWORD" || true)
   hash=$(printf '%s' "$pw" | sha256sum | cut -d' ' -f1)
-  audit_sel="\"(~audit.stream:$svc +xadd +xtrim)\" \"(~audit.streams +sadd)\""
+  audit_sel="\"(~audit.stream:$svc +xadd +xtrim)\""
   if [ "$svc" = "$audit_reader" ]; then
-    audit_sel="$audit_sel \"(~audit.stream:* +xreadgroup +xack +xautoclaim +xpending +xinfo|groups +xinfo|stream +xinfo|consumers +xgroup|create +xgroup|createconsumer +xgroup|delconsumer +xrange)\" \"(~audit.apps +sscan)\" \"(~audit.streams +sscan)\""
+    audit_sel="$audit_sel \"(~audit.stream:* +xreadgroup +xack +xautoclaim +xpending +xinfo|groups +xinfo|stream +xinfo|consumers +xgroup|create +xgroup|createconsumer +xgroup|delconsumer +xrange)\" \"(~audit.apps +sscan)\""
   fi
   reply=$(cli "ACL SETUSER $svc reset on #$hash ~$svc:* +@all -@admin -@dangerous -@scripting -function -scan -randomkey -dbsize -memory \"(~events.stream:$svc +xadd +xtrim)\" \"(~events.stream:* +xreadgroup +xack +xautoclaim +xpending +xinfo|groups +xinfo|stream +xinfo|consumers +xgroup|create +xgroup|createconsumer +xgroup|delconsumer +xrange)\" $audit_sel")
   expect_ok "$reply"

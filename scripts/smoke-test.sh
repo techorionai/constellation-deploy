@@ -151,8 +151,7 @@ acl_refused() {
 no_srem_selector() {
   local users user key
   users="$(vk_admin ACL USERS 2>&1 | tr -d '\r')"
-  if [ -z "$users" ] || ! printf '%s
-' "$users" | grep -qx audit; then
+  if [ -z "$users" ] || ! printf '%s\n' "$users" | grep -qx audit; then
     echo "the list of ACL users has no user audit: $users"
     return 1
   fi
@@ -162,6 +161,27 @@ no_srem_selector() {
       acl_refused "$user" SREM "$key" x || { echo "user $user can run SREM on $key"; return 1; }
     done
   done
+}
+
+# I61: no user can use the old set audit.streams. ACL DRYRUN uses all selectors and categories.
+test_no_audit_streams_access() {
+  local users user
+  users="$(vk_admin ACL USERS 2>&1 | tr -d '\r')"
+  if [ -z "$users" ] || ! printf '%s\n' "$users" | grep -qx audit; then
+    echo "the list of ACL users has no user audit: $users"
+    return 1
+  fi
+  for user in $users; do
+    [ "$user" = "default" ] && continue
+    acl_refused "$user" SADD audit.streams x || { echo "user $user can run SADD on audit.streams"; return 1; }
+    acl_refused "$user" SSCAN audit.streams 0 || { echo "user $user can run SSCAN on audit.streams"; return 1; }
+    acl_refused "$user" SMEMBERS audit.streams || { echo "user $user can run SMEMBERS on audit.streams"; return 1; }
+    acl_refused "$user" DEL audit.streams || { echo "user $user can run DEL on audit.streams"; return 1; }
+  done
+  if vk_admin ACL LIST 2>&1 | tr -d '\r' | grep -F 'audit.streams' | grep -v '^user default ' >/dev/null; then
+    echo "a rule of ACL LIST has the text audit.streams"
+    return 1
+  fi
 }
 
 # SISMEMBER audit.apps as the admin user. Arguments: name, expected reply (0 or 1).
@@ -869,11 +889,10 @@ test_stream_events_user() {
   expect_output NOPERM vk events "$pw" SSCAN audit.streams 0 || return 1
   # The reader user audit has the event selectors and the reader selectors.
   pw="$(envval AUDIT_VALKEY_PASSWORD)"
-  vk_admin SADD audit.streams smoke_a >/dev/null || return 1
   expect_exact OK vk audit "$pw" XGROUP CREATE events.stream:smoke_b smoke_audit_events_check 0 || return 1
   expect_output smoke_audit_events_check vk audit "$pw" XINFO GROUPS events.stream:smoke_b || return 1
-  # The old selector (~audit.streams +sscan) is for the transition.
-  expect_output smoke_a vk audit "$pw" SSCAN audit.streams 0 || return 1
+  # No selector gives access to the old set audit.streams.
+  expect_output NOPERM vk audit "$pw" SSCAN audit.streams 0 || return 1
   expect_output smoke_a vk audit "$pw" SSCAN audit.apps 0 || return 1
   expect_output NOPERM vk audit "$pw" SREM audit.apps x || return 1
   expect_output NOPERM vk audit "$pw" SREM audit.streams x || return 1
@@ -892,8 +911,8 @@ test_stream_after_restart() {
   test_stream_write_own
 }
 
-# I44: the selectors stay after a new provisioning run. Each user has exactly 4 selectors, and the
-# reader user audit has 7. The run registers the first list in audit.apps and deletes smoke_c.
+# I44: the selectors stay after a new provisioning run. Each user has exactly 3 selectors, and the
+# reader user audit has 5. The run registers the first list in audit.apps and deletes smoke_c.
 test_stream_after_reprovision() {
   local count output name
   output="$(dc run --rm --no-deps -T provision-valkey 2>&1)" || { printf '%s\n' "$output"; return 1; }
@@ -908,13 +927,13 @@ test_stream_after_reprovision() {
   expect_registered smoke_c 0 || return 1
   check_audit_apps_acl audit smoke_a || return 1
   count="$(vk_admin ACL LIST 2>&1 | tr -d '\r' | grep '^user smoke_a ' | grep -o '(~' | wc -l | tr -d ' ')"
-  if [ "$count" != "4" ]; then
-    echo "the user smoke_a has $count selectors, not 4"
+  if [ "$count" != "3" ]; then
+    echo "the user smoke_a has $count selectors, not 3"
     return 1
   fi
   count="$(selector_count audit)"
-  if [ "$count" != "7" ]; then
-    echo "the user audit has $count selectors, not 7"
+  if [ "$count" != "5" ]; then
+    echo "the user audit has $count selectors, not 5"
     return 1
   fi
 }
@@ -990,8 +1009,8 @@ test_audit_healthy() {
   svc_get http://audit:9090/readyz >/dev/null
 }
 
-# I50: a service writes its own audit stream and adds its own name to the set. It cannot write
-# the audit stream of another app.
+# I50: a service writes its own audit stream. It cannot write the audit stream of another app
+# and cannot write the old set audit.streams.
 test_audit_producer() {
   local pw out
   pw="$(envval SMOKE_A_VALKEY_PASSWORD)"
@@ -1003,13 +1022,8 @@ test_audit_producer() {
   expect_output NOPERM vk smoke_a "$pw" XADD audit.stream:smoke_b '*' k v || return 1
   # The producer cannot write the trusted set audit.apps. provision-valkey registers the name.
   expect_output NOPERM vk smoke_a "$pw" SADD audit.apps smoke_a || return 1
-  # SADD to audit.streams is the path of a producer before platform-go v0.9.0 (transition).
-  # SADD gives 1 for a new member and 0 for a member that exists.
-  out="$(vk smoke_a "$pw" SADD audit.streams smoke_a 2>&1 | tr -d '\r')"
-  case "$out" in
-    0 | 1) ;;
-    *) echo "SADD to audit.streams gave: $out"; return 1 ;;
-  esac
+  # No selector gives access to the old set audit.streams.
+  expect_output NOPERM vk smoke_a "$pw" SADD audit.streams smoke_a || return 1
 }
 
 # I51: a service that is not the reader cannot read audit streams or list the set.
@@ -1029,7 +1043,7 @@ test_audit_reader() {
   expect_exact OK vk audit "$pw" XGROUP CREATE audit.stream:smoke_a smoke_reader_check 0 || return 1
   expect_output smoke_reader_check vk audit "$pw" XINFO GROUPS audit.stream:smoke_a || return 1
   expect_output smoke_a vk audit "$pw" SSCAN audit.apps 0 || return 1
-  expect_output smoke_a vk audit "$pw" SSCAN audit.streams 0 || return 1
+  expect_output NOPERM vk audit "$pw" SSCAN audit.streams 0 || return 1
   # XREADGROUP needs +xreadgroup in the reader selector.
   expect_output audit.stream:smoke_a vk audit "$pw" XREADGROUP GROUP smoke_reader_check c1 COUNT 1 STREAMS audit.stream:smoke_a '>' || return 1
   expect_output NOPERM vk audit "$pw" XADD audit.stream:smoke_a '*' k v
@@ -1056,7 +1070,6 @@ test_audit_end_to_end() {
     echo "XADD gave: $out"
     return 1
   fi
-  vk smoke_a "$pw" SADD audit.streams smoke_a >/dev/null || return 1
   end=$((SECONDS + 90))
   while :; do
     rows="$(pg audit "$apass" audit -c "SELECT count(*) FROM audit_entries WHERE service = 'smoke_a' AND entry_id = '$id'" | tr -d '\r')"
@@ -1094,8 +1107,8 @@ test_audit_reader_variable() {
     -e 's|^AUDIT_STREAM_READER=.*|AUDIT_STREAM_READER=events|' "$env_file" > "$extra_env_file"
   docker compose -p "$project" --env-file "$extra_env_file" run --rm --no-deps -T provision-valkey >/dev/null 2>&1 \
     || { echo "provision-valkey failed with the second env file"; result=1; }
-  if [ "$(selector_count events)" != "7" ] || [ "$(selector_count audit)" != "4" ]; then
-    echo "events has $(selector_count events) selectors and audit has $(selector_count audit), not 7 and 4"
+  if [ "$(selector_count events)" != "5" ] || [ "$(selector_count audit)" != "3" ]; then
+    echo "events has $(selector_count events) selectors and audit has $(selector_count audit), not 5 and 3"
     result=1
   fi
   if ! reader_selector_users | grep -qx events || reader_selector_users | grep -qx audit; then
@@ -1105,8 +1118,8 @@ test_audit_reader_variable() {
   check_audit_apps_acl events audit || result=1
   rm -f "$extra_env_file"
   dc run --rm --no-deps -T provision-valkey >/dev/null 2>&1 || { echo "provision-valkey failed after the restore"; result=1; }
-  if [ "$(selector_count audit)" != "7" ] || [ "$(selector_count events)" != "4" ]; then
-    echo "the restore did not give 7 selectors to audit and 4 to events"
+  if [ "$(selector_count audit)" != "5" ] || [ "$(selector_count events)" != "3" ]; then
+    echo "the restore did not give 5 selectors to audit and 3 to events"
     result=1
   fi
   if ! reader_selector_users | grep -qx audit || reader_selector_users | grep -qx events; then
@@ -1170,17 +1183,14 @@ test_identity_denied_limit() {
   # One full request, then a burst of 39 requests. The 40 requests are in one 1 minute window.
   out="$(identity_raw_token "$cid")"
   code="$(http_code "$out")"
-  if [ "$code" != "401" ] || ! printf '%s
-' "$out" | grep -qF 'invalid_client'; then
+  if [ "$code" != "401" ] || ! printf '%s\n' "$out" | grep -qF 'invalid_client'; then
     echo "request 1 got status $code: $(printf "%s" "$out" | tail -n 3)"
     return 1
   fi
   out="$(identity_token_burst "$cid" 39)"
-  count="$(printf '%s
-' "$out" | grep -cE '^HTTP/[0-9.]+ 401' || true)"
+  count="$(printf '%s\n' "$out" | grep -cE '^HTTP/[0-9.]+ 401' || true)"
   if [ "$count" != "39" ]; then
-    echo "$count of 39 burst requests got status 401: $(printf '%s
-' "$out" | sort | uniq -c | head -n 5)"
+    echo "$count of 39 burst requests got status 401: $(printf '%s\n' "$out" | sort | uniq -c | head -n 5)"
     return 1
   fi
   end=$((SECONDS + 30))
@@ -1394,6 +1404,7 @@ run_check "I55: audit database and Valkey isolation" test_audit_isolation
 run_check "I56: no secret in the audit log, password encoding" test_audit_no_secret_in_logs
 run_check "I57: audit API refuses a request with no token" test_audit_no_token
 run_check "I54: AUDIT_STREAM_READER names another user" test_audit_reader_variable
+run_check "I61: no user can use audit.streams" test_no_audit_streams_access
 
 if [ "${#failures[@]}" -ne 0 ]; then
   echo "smoke-test: ${#failures[@]} check(s) failed: ${failures[*]}"
