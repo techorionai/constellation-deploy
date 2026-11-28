@@ -151,8 +151,7 @@ acl_refused() {
 no_srem_selector() {
   local users user key
   users="$(vk_admin ACL USERS 2>&1 | tr -d '\r')"
-  if [ -z "$users" ] || ! printf '%s
-' "$users" | grep -qx audit; then
+  if [ -z "$users" ] || ! printf '%s\n' "$users" | grep -qx audit; then
     echo "the list of ACL users has no user audit: $users"
     return 1
   fi
@@ -168,8 +167,7 @@ no_srem_selector() {
 test_no_audit_streams_access() {
   local users user
   users="$(vk_admin ACL USERS 2>&1 | tr -d '\r')"
-  if [ -z "$users" ] || ! printf '%s
-' "$users" | grep -qx audit; then
+  if [ -z "$users" ] || ! printf '%s\n' "$users" | grep -qx audit; then
     echo "the list of ACL users has no user audit: $users"
     return 1
   fi
@@ -1185,17 +1183,14 @@ test_identity_denied_limit() {
   # One full request, then a burst of 39 requests. The 40 requests are in one 1 minute window.
   out="$(identity_raw_token "$cid")"
   code="$(http_code "$out")"
-  if [ "$code" != "401" ] || ! printf '%s
-' "$out" | grep -qF 'invalid_client'; then
+  if [ "$code" != "401" ] || ! printf '%s\n' "$out" | grep -qF 'invalid_client'; then
     echo "request 1 got status $code: $(printf "%s" "$out" | tail -n 3)"
     return 1
   fi
   out="$(identity_token_burst "$cid" 39)"
-  count="$(printf '%s
-' "$out" | grep -cE '^HTTP/[0-9.]+ 401' || true)"
+  count="$(printf '%s\n' "$out" | grep -cE '^HTTP/[0-9.]+ 401' || true)"
   if [ "$count" != "39" ]; then
-    echo "$count of 39 burst requests got status 401: $(printf '%s
-' "$out" | sort | uniq -c | head -n 5)"
+    echo "$count of 39 burst requests got status 401: $(printf '%s\n' "$out" | sort | uniq -c | head -n 5)"
     return 1
   fi
   end=$((SECONDS + 30))
