@@ -1,6 +1,6 @@
 # Docker Compose base
 
-`compose.yaml` runs the base of the platform on one host: PostgreSQL, Valkey, and the Grafana LGTM stack (OpenTelemetry Collector, Prometheus, Loki, Tempo, and Grafana). Each part is a separate container. It also runs the platform services identity, events, and audit.
+`compose.yaml` runs the base of the platform on one host: PostgreSQL, Valkey, and the Grafana LGTM stack (OpenTelemetry Collector, Prometheus, Loki, Tempo, and Grafana). Each part is a separate container. It also runs the platform services identity, events, audit, and helpdesk.
 
 ## Requirements
 
@@ -22,17 +22,18 @@
 
    Then set the owner and the mode of the file (see "Master key").
 
-5. Make the client keys of the events and audit services and the clients file of identity (see "Service clients"). Run this step before `docker compose up -d`. Without the clients file, identity does not start, and Docker makes no directory at the missing path.
+5. Make the client keys of the events, audit, and helpdesk services and the clients file of identity (see "Service clients"). Run this step before `docker compose up -d`. Without the clients file, identity does not start, and Docker makes no directory at the missing path.
 
    ```sh
    bash scripts/new-service-client.sh events
    bash scripts/new-service-client.sh audit
+   bash scripts/new-service-client.sh helpdesk events:producer
    ```
 
-   Then set the owner of the key as the script prints (`sudo chown 65532:65532 secrets/events-client-key.pem secrets/audit-client-key.pem`). On Docker Desktop, use the fallback in "Service clients".
+   Then set the owner of the key as the script prints (`sudo chown 65532:65532 secrets/events-client-key.pem secrets/audit-client-key.pem secrets/helpdesk-client-key.pem`). On Docker Desktop, use the fallback in "Service clients".
 
 6. Start the base: `docker compose up -d`.
-7. Examine the states: `docker compose ps`. The services `postgres`, `valkey`, `prometheus`, `grafana`, `identity`, `events`, and `audit` show `healthy`. The collector, Loki, and Tempo show `running`, because their images have no shell for a health check. The services `provision-postgres` and `provision-valkey` show `exited (0)`.
+7. Examine the states: `docker compose ps`. The services `postgres`, `valkey`, `prometheus`, `grafana`, `identity`, `events`, `audit`, and `helpdesk` show `healthy`. The collector, Loki, and Tempo show `running`, because their images have no shell for a health check. The services `provision-postgres` and `provision-valkey` show `exited (0)`.
 8. Open Grafana at `http://127.0.0.1:3000`. Log in with `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD`.
 
 Use `docker compose up -d` and not `docker compose up -d --wait` for the base. Compose 5 returns an error for `--wait` when a one-shot service exits and no other service depends on it. A service block that depends on both provisioning services (see "Add a service") works with `--wait`.
@@ -45,10 +46,10 @@ All settings are in `.env`. Compose reads `.env` in the project folder. The vari
 | -------- | ------- | --- |
 | `CONSTELLATION_SERVICES` | empty | Names of the platform services. Comma-separated. |
 | `POSTGRES_USER`, `POSTGRES_PASSWORD` | `postgres`, none | PostgreSQL admin. |
-| `POSTGRES_MAX_CONNECTIONS` | `200` | `max_connections` of PostgreSQL. |
+| `POSTGRES_MAX_CONNECTIONS` | `250` | `max_connections` of PostgreSQL. |
 | `VALKEY_ADMIN_PASSWORD` | none | Password of the Valkey `default` (admin) user. |
 | `VALKEY_MAXMEMORY` | `256mb` | Memory limit of Valkey. See "Valkey" for the sizing rules. |
-| `AUDIT_STREAM_RETENTION` | `24h` | Age limit of the audit streams of identity and events. See "Audit stream retention". |
+| `AUDIT_STREAM_RETENTION` | `24h` | Age limit of the audit streams of identity, events, and the helpdesk. See "Audit stream retention". |
 | `GRAFANA_ADMIN_USER`, `GRAFANA_ADMIN_PASSWORD` | `admin`, none | Grafana admin. |
 | `GRAFANA_SECRET_KEY` | none | Key that Grafana uses to encrypt the secrets in its database. A change later makes the stored data source secrets unreadable. |
 | `SERVICE_DB_CONNECTION_LIMIT` | `50` | Maximum number of connections for each service role in PostgreSQL. Keep the number of services times this value lower than `POSTGRES_MAX_CONNECTIONS`. |
@@ -64,6 +65,10 @@ All settings are in `.env`. Compose reads `.env` in the project folder. The vari
 | `AUDIT_DB_PASSWORD`, `AUDIT_DB_PASSWORD_URLENCODED`, `AUDIT_VALKEY_PASSWORD` | none | Database and Valkey passwords of the audit service. The second value is the URL-encoded form of the first. |
 | `AUDIT_CLIENT_KEY_FILE` | none | Path of the client key file of the audit service on the host. |
 | `AUDIT_CLIENT_KEY_ID` | none | ID of the client key. It is not a secret. |
+| `HELPDESK_DB_PASSWORD`, `HELPDESK_DB_PASSWORD_URLENCODED`, `HELPDESK_VALKEY_PASSWORD` | none | Database and Valkey passwords of the helpdesk. The second value is the URL-encoded form of the first. |
+| `HELPDESK_CLIENT_KEY_FILE`, `HELPDESK_CLIENT_KEY_ID` | none | Path of the client key file of the helpdesk on the host, and the ID of the key. The ID is not a secret. |
+| `HELPDESK_BIND`, `HELPDESK_PORT` | `127.0.0.1`, `8081` | Host IP and host port of the helpdesk. Keep the bind on loopback unless a TLS reverse proxy runs on the same host. |
+| `HELPDESK_TRUSTED_PROXIES` | empty | CIDR list of the reverse proxies in front of the helpdesk. Set it when you use a proxy (see "Helpdesk service"). |
 | `AUDIT_STREAM_READER` | `audit` | The one service user that reads the audit streams (see "Audit stream ACL"). It must be in `CONSTELLATION_SERVICES`. |
 | `IDENTITY_BIND`, `IDENTITY_PORT` | `127.0.0.1`, `8080` | Host IP and host port of identity. Keep the bind on loopback unless a TLS reverse proxy runs on the same host. |
 | `IDENTITY_TRUSTED_PROXIES` | empty | CIDR list of the reverse proxies in front of identity. Set it when you use a proxy (see "Identity"). |
@@ -84,7 +89,7 @@ Grafana does not send requests to third parties. The news feed, Gravatar, the pl
 
 ## Ports
 
-Grafana and identity publish a host port. Grafana uses `${GRAFANA_BIND:-127.0.0.1}:${GRAFANA_PORT:-3000}`. Identity uses `${IDENTITY_BIND:-127.0.0.1}:${IDENTITY_PORT:-8080}` for its public port. To reach them from other hosts, set the bind variable and put a TLS reverse proxy in front. Identity needs TLS for a host other than `localhost` (see "Identity"). TLS is out of scope for this repository.
+Grafana, identity, and the helpdesk publish a host port. Grafana uses `${GRAFANA_BIND:-127.0.0.1}:${GRAFANA_PORT:-3000}`. Identity uses `${IDENTITY_BIND:-127.0.0.1}:${IDENTITY_PORT:-8080}` for its public port. The helpdesk uses `${HELPDESK_BIND:-127.0.0.1}:${HELPDESK_PORT:-8081}` for its public port. MCP clients and API clients of a person must reach the helpdesk. To reach these services from other hosts, set the bind variable and put a TLS reverse proxy in front. Identity needs TLS for a host other than `localhost` (see "Identity"). TLS is out of scope for this repository.
 
 Do not publish other ports. This includes the OTLP ports of the collector (4317 and 4318) and the admin port of each platform service (`:9090` with `/livez` and `/readyz`). A service in the `services` network reaches the collector at `http://otel-collector:4318`.
 
@@ -250,9 +255,23 @@ The service `audit` is the audit service of the platform. It uses the image `ghc
 - `AUDIT_HTTP__TRUSTED_PROXIES` stays empty in `compose.yaml`, because the service has no proxy. If a caller that is not a proxy could send forwarded headers, the caller could write a false IP address into its own export entry. If you add a reverse proxy in front of the audit service, set `AUDIT_HTTP__TRUSTED_PROXIES` to the CIDR of the proxy.
 - The images of identity `0.9.1` and events `0.2.1` write audit entries to the Valkey streams `audit.stream:identity` and `audit.stream:events`. See "Audit stream retention".
 
+## Helpdesk service
+
+The service `helpdesk` keeps customers and tickets. It uses the image `ghcr.io/techorionai/constellation-helpdesk:0.1.0`, the database `helpdesk`, and the Valkey user `helpdesk`. It publishes its API port `8080` as `${HELPDESK_BIND:-127.0.0.1}:${HELPDESK_PORT:-8081}`. The admin port `9090` is not published.
+
+- The helpdesk is a service client, as the events service is (see "Service clients"). Make its key with `bash scripts/new-service-client.sh helpdesk events:producer`. The role `events:producer` lets the helpdesk register its event types. The helpdesk reads the private key as the Compose secret `helpdesk_client_key` from the file `HELPDESK_CLIENT_KEY_FILE`.
+- It starts after identity and events are healthy. It is ready only after it publishes its event types and its manifest to the events service. If `readyz` does not give 200, examine `HELPDESK_CLIENT_KEY_ID` and the clients file first.
+- The helpdesk checks a token with the keys of identity. For an opaque token, it calls the introspection endpoint at `http://identity:8080/oauth/introspect`. `compose.yaml` sets this URL, because the default URL comes from the issuer, which is not the address in the Compose network.
+- The manifest of the helpdesk has the roles `support_agent` (all four scopes) and `viewer` (the two read scopes). Identity makes the roles `helpdesk:support_agent` and `helpdesk:viewer`. Give a role to a person or to a service with the operation `UserRoles_assign` of identity, or in the clients file for a service client.
+- The audience of a token for the helpdesk is `helpdesk`. A token of another audience gives 401. A token with too few scopes gives 403.
+- `HELPDESK_TRUSTED_PROXIES` is the CIDR list of the reverse proxies in front of the helpdesk. If you use a proxy and do not set it, the helpdesk sees the address of the proxy as the client address of all callers, and the audit entries have the proxy address. Each trusted proxy must append the address of its peer to `X-Forwarded-For`.
+- Keep `HELPDESK_BIND` on `127.0.0.1` unless a TLS reverse proxy runs on the same host. With `HELPDESK_BIND=0.0.0.0`, the helpdesk serves plain HTTP on all interfaces, and tokens go on the network in plain text. A port that Docker publishes also bypasses host firewalls such as `ufw`.
+- The helpdesk pool has 8 connections (`HELPDESK_DATABASE__MAX_CONNS`). The role limit is `SERVICE_DB_CONNECTION_LIMIT`.
+- The smoke test makes the client `smoke_helpdesk` with the roles `helpdesk:support_agent` and `events:reader`. It gets a token with a `private_key_jwt` assertion and creates a customer and a ticket. Then it examines the audit entry in the audit database and the event types in the event catalog.
+
 ## Audit stream retention
 
-Identity and events trim their audit stream by age. `compose.yaml` sets `IDENTITY_RETENTION__AUDIT_STREAM__PERIOD` and `EVENTS_RETENTION__AUDIT_STREAM__PERIOD` to `AUDIT_STREAM_RETENTION`. The default is `24h`. The image default is `168h`.
+Identity, events, and the helpdesk trim their audit stream by age. `compose.yaml` sets `IDENTITY_RETENTION__AUDIT_STREAM__PERIOD`, `EVENTS_RETENTION__AUDIT_STREAM__PERIOD`, and `HELPDESK_RETENTION__AUDIT_STREAM__PERIOD` to `AUDIT_STREAM_RETENTION`. The default is `24h`. The image default is `168h`.
 
 - The trim also deletes entries that the audit service did not read. If the audit service stops for longer than the period, the platform loses audit entries without a sign. Set `AUDIT_STREAM_RETENTION` to a value that is longer than the longest stop of the audit service. After a stop, examine the audit service and make it read the streams before the period ends.
 - A short period keeps the streams small. Identity writes a `denied` audit entry for each failed request to `/oauth/token`. An unauthenticated caller can make these entries. Identity `0.9.0` and later limit them with four buckets. A request of an unauthenticated caller goes through `token_denied` (30 in 1 minute for each IP), `token_denied_daily` (1000 in 24 hours for each IP), and `token_denied_global` (100000 in 24 hours). A request of a client that authenticated goes through `token_denied` and `token_denied_client` (600 in 1 hour for each client ID). The counter `identity.audit.denied_dropped` counts the dropped entries, with the `reason` values `rate_limit_token_denied`, `rate_limit_token_denied_daily`, `rate_limit_token_denied_global`, `rate_limit_token_denied_client`, `rate_limit_admin_denied`, `rate_limit_admin_denied_daily`, and `fallback_limit`. Watch it in Grafana. An attacker can use up the global bucket and stop the denied token entries of unauthenticated callers for 24 hours. The denied token entries of authenticated clients still pass. Behind a proxy without `IDENTITY_TRUSTED_PROXIES`, all clients share one `token_denied` bucket. See "Valkey" for the sizing rules.
@@ -502,6 +521,26 @@ If step 5 comes before step 4, the audit service gets `NOPERM` on `SSCAN audit.a
 The release `v0.6.0` deletes the transition selectors. See "Upgrade from v0.5.0 to v0.6.0".
 
 Identity `0.9.0` limits the denied token entries. See "Audit stream retention" and "Valkey" for the buckets, the counter, and the new sizing rule.
+
+## Upgrade from v0.6.0 to v0.7.0
+
+The release `v0.7.0` adds the helpdesk service `0.1.0`. It also changes the default of `POSTGRES_MAX_CONNECTIONS` from `200` to `250`. The helpdesk is a fourth service role, and 4 times 50 is not lower than 200. Do these steps in this order:
+
+1. Make a backup of the databases and of the folder `secrets/`.
+2. Get the files of the release `v0.7.0`.
+3. In `.env`, add `helpdesk` to `CONSTELLATION_SERVICES`. Add `HELPDESK_DB_PASSWORD`, `HELPDESK_DB_PASSWORD_URLENCODED`, `HELPDESK_VALKEY_PASSWORD`, `HELPDESK_CLIENT_KEY_FILE`, and `HELPDESK_CLIENT_KEY_ID`. Until these values exist, each Compose command stops with an error that names the variable. Optional: `HELPDESK_BIND`, `HELPDESK_PORT`, and `HELPDESK_TRUSTED_PROXIES`.
+4. If `.env` sets `POSTGRES_MAX_CONNECTIONS`, set it to 250 or more. An install with no value gets the new default. Keep the number of services times `SERVICE_DB_CONNECTION_LIMIT` lower than this value.
+5. Run `bash scripts/new-service-client.sh helpdesk events:producer`. Set the owner of the key as the script says. The script changes the clients file, so restart identity: `docker compose restart identity`. A change of the clients file needs a restart of identity.
+6. Run `docker compose pull`.
+7. Run `docker compose run --rm provision-postgres` and `docker compose run --rm provision-valkey`. This makes the database, the role, and the Valkey user of the helpdesk, and it registers `helpdesk` in `audit.apps`.
+8. Run `docker compose up -d`. If you changed `POSTGRES_MAX_CONNECTIONS`, this restarts PostgreSQL.
+9. Examine the states with `docker compose ps`. The service `helpdesk` shows `healthy`.
+
+### Roll back to v0.6.0
+
+1. Get the files of the release `v0.6.0`.
+2. Remove the helpdesk variables from `.env` if you want. The database `helpdesk` and the Valkey user `helpdesk` stay.
+3. Run `docker compose up -d --remove-orphans`.
 
 ## Upgrade from v0.5.0 to v0.6.0
 
